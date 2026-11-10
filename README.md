@@ -36,10 +36,12 @@ git status --ignored
 ```
 
 ```bash
-git ls-files | grep -Ei "parquet|csv|rds|dbf|shp|zip|logs/"
+git ls-files | grep -Ei "parquet|csv|rds|dbf|shp|zip|logs/" | grep -v "^etl/ref/"
 ```
 
-O segundo comando **não pode retornar nada**. Se algum dado for commitado por engano,
+O segundo comando **não pode retornar nada**. Os CSVs de `etl/ref/` são a única
+exceção permitida: são agregados públicos e o dicionário de códigos, sem dado
+individual (ver seção ETL). Se algum dado for commitado por engano,
 apagar o arquivo num commit novo **não basta**: ele continua no histórico. Nesse caso
 é preciso reescrever o histórico (`git filter-repo`) e tratar o caso como incidente.
 
