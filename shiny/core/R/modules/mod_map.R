@@ -1,0 +1,3146 @@
+# dashs/shiny/core/R/modules/mod_map.R
+
+suppressPackageStartupMessages({
+  library(shiny)
+  library(bslib)
+  library(leaflet)
+  library(sf)
+  library(dplyr)
+  library(arrow)
+  library(htmlwidgets)
+  library(magrittr)
+  library(htmltools)
+  library(later)
+})
+
+`%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+
+if (!exists(".SINAN_UTILS_LOADED", inherits = TRUE) || !isTRUE(get(".SINAN_UTILS_LOADED", inherits = TRUE))) {
+  if (exists(".source_utils_if_needed", mode = "function", inherits = TRUE)) {
+    .source_utils_if_needed()
+  } else {
+    p <- normalizePath(tryCatch(getwd(), error = function(e) "."), winslash = "/", mustWork = FALSE)
+    for (i in 0:12) {
+      cand <- file.path(p, "dashs", "shiny", "core", "R", "utils.R")
+      if (file.exists(cand)) { source(cand, local = FALSE); break }
+      p2 <- dirname(p)
+      if (identical(p2, p)) break
+      p <- p2
+    }
+  }
+}
+
+if (!exists(".res", mode = "function", inherits = TRUE)) {
+  .res <- function(x) {
+    if (is.null(x)) return(NULL)
+    if (is.function(x)) return(tryCatch(x(), error = function(e) NULL))
+    x
+  }
+}
+if (!exists(".obj_get", mode = "function", inherits = TRUE)) {
+  .obj_get <- function(obj, key, default = NULL) {
+    obj <- .res(obj)
+    if (is.null(obj)) return(default)
+    if (inherits(obj, "reactivevalues")) return(tryCatch(obj[[key]] %||% default, error = function(e) default))
+    if (is.list(obj)) return(obj[[key]] %||% default)
+    if (is.environment(obj) && exists(key, envir = obj, inherits = FALSE)) return(get(key, envir = obj, inherits = FALSE) %||% default)
+    default
+  }
+}
+if (!exists(".obj_set", mode = "function", inherits = TRUE)) {
+  .obj_set <- function(obj, key, value) {
+    if (is.null(obj)) return(invisible(NULL))
+    if (inherits(obj, "reactivevalues")) { obj[[key]] <- value; return(invisible(NULL)) }
+    if (is.environment(obj)) { assign(key, value, envir = obj); return(invisible(NULL)) }
+    if (is.list(obj)) { obj[[key]] <- value; return(invisible(NULL)) }
+    invisible(NULL)
+  }
+}
+if (!exists(".pick_scalar", mode = "function", inherits = TRUE)) {
+  .pick_scalar <- function(x, default = NULL) {
+    x <- .res(x)
+    if (is.null(x) || length(x) == 0) return(default)
+    if (is.atomic(x)) {
+      out <- x[[1]]
+      if (is.character(out) && !nzchar(out)) return(default)
+      return(out)
+    }
+    default
+  }
+}
+if (!exists(".to_uf", mode = "function", inherits = TRUE)) {
+  .to_uf <- function(x) {
+    if (is.null(x)) return(NA_character_)
+    x <- toupper(trimws(as.character(x)))
+    x <- ifelse(nzchar(x), x, NA_character_)
+    x
+  }
+}
+if (!exists(".to_mun7", mode = "function", inherits = TRUE)) {
+  .to_mun7 <- function(x) {
+    if (is.null(x)) return(NA_character_)
+    s <- gsub("\\D+", "", as.character(x))
+    s <- ifelse(nzchar(s), s, NA_character_)
+    short <- !is.na(s) & nchar(s) < 7
+    if (any(short)) s[short] <- sprintf("%07s", s[short])
+    s <- gsub(" ", "0", s)
+    long <- !is.na(s) & nchar(s) > 7
+    if (any(long)) s[long] <- substr(s[long], 1, 7)
+    s
+  }
+}
+if (!exists(".find_dashboard_dir", mode = "function", inherits = TRUE)) {
+  .find_dashboard_dir <- function(cfg) {
+    cfg <- .res(cfg) %||% list()
+    dash <- .obj_get(cfg, "DASHBOARD_DIR", NULL) %||% .obj_get(cfg, "dashboard_dir", NULL)
+    if (is.character(dash) && nzchar(dash) && dir.exists(dash)) return(normalizePath(dash, winslash = "/", mustWork = FALSE))
+    p <- normalizePath(tryCatch(getwd(), error = function(e) "."), winslash = "/", mustWork = FALSE)
+    for (i in 0:12) {
+      cand <- file.path(p, "data", "parquet")
+      if (dir.exists(cand)) return(normalizePath(cand, winslash = "/", mustWork = FALSE))
+      p2 <- dirname(p)
+      if (identical(p2, p)) break
+      p <- p2
+    }
+    normalizePath(file.path(getwd(), "data", "parquet"), winslash = "/", mustWork = FALSE)
+  }
+}
+if (!exists(".sinan_log_open", mode = "function", inherits = TRUE))  .sinan_log_open  <- function(...) invisible(NULL)
+if (!exists(".sinan_log_write", mode = "function", inherits = TRUE)) .sinan_log_write <- function(...) invisible(NULL)
+
+.local_arrow_perf_defaults <- function() {
+  try(options(arrow.use_threads = TRUE), silent = TRUE)
+  try(options(arrow.s3 = FALSE), silent = TRUE)
+  try(arrow::set_cpu_count(max(1L, parallel::detectCores(logical = TRUE))), silent = TRUE)
+  invisible(NULL)
+}
+
+.hex_to_rgb01 <- function(hex) {
+  if (is.null(hex) || !nzchar(hex)) return(c(NA_real_, NA_real_, NA_real_))
+  hex <- toupper(trimws(as.character(hex[[1]])))
+  if (!grepl("^#", hex)) hex <- paste0("#", hex)
+  if (!grepl("^#[0-9A-F]{6}$", hex)) return(c(NA_real_, NA_real_, NA_real_))
+  r <- strtoi(substr(hex, 2, 3), 16L) / 255
+  g <- strtoi(substr(hex, 4, 5), 16L) / 255
+  b <- strtoi(substr(hex, 6, 7), 16L) / 255
+  c(r, g, b)
+}
+.rgb01_to_hex <- function(rgb) {
+  rgb <- pmax(0, pmin(1, as.numeric(rgb)))
+  rr <- sprintf("%02X", as.integer(round(rgb[1] * 255)))
+  gg <- sprintf("%02X", as.integer(round(rgb[2] * 255)))
+  bb <- sprintf("%02X", as.integer(round(rgb[3] * 255)))
+  paste0("#", rr, gg, bb)
+}
+.hex_mix <- function(a, b, t = 0.5) {
+  ra <- .hex_to_rgb01(a); rb <- .hex_to_rgb01(b)
+  if (!all(is.finite(ra)) || !all(is.finite(rb))) return(a %||% b)
+  t <- as.numeric(t); if (!is.finite(t)) t <- 0.5
+  .rgb01_to_hex((1 - t) * ra + t * rb)
+}
+
+.metric_base_color <- function(mtr, pack) {
+  cols <- .res(.obj_get(pack, "COLORS", NULL)) %||% list()
+
+  primary   <- .obj_get(cols, "primary",   NULL) %||% "#111827"
+  secondary <- .obj_get(cols, "secondary", NULL) %||% "#2563EB"
+  danger    <- .obj_get(cols, "danger",    NULL) %||% "#DC2626"
+  success   <- .obj_get(cols, "success",   NULL) %||% "#16A34A"
+
+  cases_c  <- .obj_get(cols, "cases",  NULL) %||% danger
+  obitos_c <- .obj_get(cols, "obitos", NULL) %||% "#DC2626"
+  cura_c   <- .obj_get(cols, "cura",   NULL) %||% success
+  pop_c    <- .obj_get(cols, "pop",    NULL) %||% primary
+  incid_c  <- .obj_get(cols, "incid",  NULL) %||% secondary
+
+  mtr <- as.character(mtr %||% "incid")
+  if (identical(mtr, "cases"))  return(cases_c)
+  if (identical(mtr, "obitos")) return(obitos_c)
+  if (identical(mtr, "cura"))   return(cura_c)
+  if (identical(mtr, "pop"))    return(pop_c)
+  if (identical(mtr, "incid"))  return(incid_c)
+  secondary
+}
+
+
+.metric_palette_colors <- function(mtr, pack) {
+  mtr <- as.character(mtr %||% "incid")
+
+  p <- NULL
+  if (identical(mtr, "cases"))  p <- .obj_get(pack, "MAP_PALETTE_CASES",  NULL)
+  if (identical(mtr, "incid"))  p <- .obj_get(pack, "MAP_PALETTE_INCID",  NULL)
+  if (identical(mtr, "obitos")) p <- .obj_get(pack, "MAP_PALETTE_OBITOS", NULL)
+  if (identical(mtr, "cura"))   p <- .obj_get(pack, "MAP_PALETTE_CURA",   NULL)
+  if (identical(mtr, "pop"))    p <- .obj_get(pack, "MAP_PALETTE_POP",    NULL)
+
+  if (!is.null(p)) {
+    p <- as.character(unlist(p))
+    p <- p[!is.na(p) & nzchar(p)]
+    if (length(p) >= 4) return(p)
+  }
+
+  base <- .metric_base_color(mtr, pack)
+  c(
+    .hex_mix("#FFFFFF", base, 0.35),
+    .hex_mix("#FFFFFF", base, 0.55),
+    .hex_mix("#FFFFFF", base, 0.72),
+    base,
+    .hex_mix("#000000", base, 0.18),
+    .hex_mix("#000000", base, 0.34),
+    .hex_mix("#000000", base, 0.52)
+  )
+}
+
+.map_quartile_legend <- function(vals, palette, na.color, positive_only = FALSE) {
+  v <- as.numeric(vals)
+  valid <- is.finite(v)
+  if (positive_only) valid <- valid & v > 0
+  if (!any(valid)) return(list(pal = function(x) rep(na.color, length(x)), colors = na.color,
+                              labels = if (any(is.finite(v) & v == 0)) "Sem casos" else "Sem dados"))
+  q <- as.numeric(stats::quantile(v[valid], c(0, .25, .5, .75, 1), names = FALSE))
+  colors <- leaflet::colorNumeric(palette, domain = c(1, 4))(1:4)
+  classify <- function(x) {
+    out <- 1L + as.integer(x > q[2]) + as.integer(x > q[3]) + as.integer(x > q[4])
+    out[!is.finite(x)] <- NA_integer_
+    if (positive_only) out[is.finite(x) & x <= 0] <- NA_integer_
+    out
+  }
+  pal <- function(x) {
+    cls <- classify(x)
+    out <- colors[cls]
+    out[is.na(cls)] <- na.color
+    out
+  }
+  fmt <- function(x) formatC(x, format = "f", digits = 4, big.mark = ".", decimal.mark = ",")
+  labels <- c(paste0("> ", fmt(q[4])),
+              paste0("> ", fmt(q[3]), " a \u2264 ", fmt(q[4])),
+              paste0("> ", fmt(q[2]), " a \u2264 ", fmt(q[3])),
+              paste0("\u2264 ", fmt(q[2])))
+  legend_colors <- rev(colors)
+  if (positive_only) {
+    legend_colors <- c(legend_colors, na.color)
+    labels <- c(labels, "Sem casos")
+  }
+  if (any(!is.finite(v))) {
+    legend_colors <- c(legend_colors, na.color)
+    labels <- c(labels, "Sem dados")
+  }
+  list(pal = pal, colors = legend_colors, labels = labels)
+}
+.safe_palette_quantile <- function(vals, k = 6L, palette = NULL, na.color = "#F3F4F6") {
+  tryCatch({
+    v <- suppressWarnings(as.numeric(vals))
+    v <- v[is.finite(v)]
+    if (length(v) == 0) {
+      return(list(pal = function(x) rep(na.color, length(x)), legend = FALSE, bins = NULL))
+    }
+
+    k <- as.integer(k %||% 6L)
+    if (!is.finite(k) || k < 4L) k <- 6L
+
+    probs <- c(0, .25, .5, .75, 1)
+    qs <- suppressWarnings(as.numeric(stats::quantile(v, probs = probs, na.rm = TRUE, names = FALSE, type = 7)))
+    qs <- sort(unique(qs))
+
+    if (length(qs) < 2) {
+      rr <- range(v, na.rm = TRUE)
+      if (is.finite(rr[1]) && is.finite(rr[2]) && rr[1] == rr[2]) {
+        eps <- if (rr[1] == 0) 1 else abs(rr[1]) * 0.01
+        qs <- sort(unique(c(rr[1] - eps, rr[2] + eps)))
+      }
+    }
+
+    if (length(qs) < 2) {
+      return(list(pal = function(x) rep(na.color, length(x)), legend = FALSE, bins = NULL))
+    }
+
+    pal_arg <- palette %||% "YlOrRd"
+
+    pal <- leaflet::colorBin(
+      palette  = pal_arg,
+      domain   = v,
+      bins     = qs,
+      na.color = na.color,
+      pretty   = FALSE,
+      right    = TRUE
+    )
+
+    list(pal = pal, legend = TRUE, bins = qs)
+  }, error = function(e) {
+    list(
+      pal = function(x) rep(na.color, length(x)),
+      legend = FALSE,
+      bins = NULL,
+      err = conditionMessage(e)
+    )
+  })
+}
+
+# ----------------------------------------------------------------------
+# Geometry
+# ----------------------------------------------------------------------
+.sf_fix_for_leaflet <- function(g) {
+  g <- .res(g)
+  if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) return(g)
+
+  g <- tryCatch(sf::st_zm(g, drop = TRUE, what = "ZM"), error = function(e) g)
+  g <- tryCatch(sf::st_make_valid(g), error = function(e) g)
+
+  ok <- tryCatch(!sf::st_is_empty(g), error = function(e) rep(TRUE, nrow(g)))
+  if (any(!ok)) g <- g[ok, , drop = FALSE]
+  if (nrow(g) == 0) return(g)
+
+  g <- tryCatch({
+    geom <- sf::st_geometry(g)
+    types <- suppressWarnings(as.character(sf::st_geometry_type(geom, by_geometry = TRUE)))
+    needs_extract <- any(types %in% c("GEOMETRYCOLLECTION", "MULTISURFACE", "POLYHEDRALSURFACE")) ||
+      any(!types %in% c("POLYGON", "MULTIPOLYGON"))
+    if (isTRUE(needs_extract)) {
+      geom <- suppressWarnings(sf::st_collection_extract(geom, "POLYGON", warn = FALSE))
+    }
+    geom <- suppressWarnings(sf::st_cast(geom, "MULTIPOLYGON", warn = FALSE))
+    sf::st_set_geometry(g, geom)
+  }, error = function(e) g)
+
+  g <- tryCatch(sf::st_transform(g, 4326), error = function(e) g)
+
+  ok2 <- tryCatch(!sf::st_is_empty(g), error = function(e) rep(TRUE, nrow(g)))
+  if (any(!ok2)) g <- g[ok2, , drop = FALSE]
+  g
+}
+
+.simplify_sf <- function(g, denom = 900, preserve = TRUE) {
+  g <- .res(g)
+  if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) return(g)
+  tryCatch({
+    bb <- sf::st_bbox(g)
+    dx <- as.numeric(bb[["xmax"]] - bb[["xmin"]])
+    if (!is.finite(dx) || dx <= 0) return(g)
+    tol <- dx / as.numeric(denom %||% 900)
+    if (!is.finite(tol) || tol <= 0) return(g)
+    sf::st_simplify(g, dTolerance = tol, preserveTopology = isTRUE(preserve))
+  }, error = function(e) g)
+}
+
+.st_read_quiet <- function(path) {
+  if (is.null(path) || !nzchar(path) || !file.exists(path)) return(NULL)
+  p <- normalizePath(path, winslash = "/", mustWork = FALSE)
+  if (grepl("\\.gz$", p, ignore.case = TRUE)) p <- paste0("/vsigzip/", p)
+  tryCatch(sf::st_read(p, quiet = TRUE), error = function(e) NULL)
+}
+
+.bbox_num <- function(bb) {
+  if (is.null(bb)) return(NULL)
+  xmin <- suppressWarnings(as.numeric(bb[["xmin"]]))
+  ymin <- suppressWarnings(as.numeric(bb[["ymin"]]))
+  xmax <- suppressWarnings(as.numeric(bb[["xmax"]]))
+  ymax <- suppressWarnings(as.numeric(bb[["ymax"]]))
+  if (!all(is.finite(c(xmin, ymin, xmax, ymax)))) return(NULL)
+  c(xmin, ymin, xmax, ymax)
+}
+
+.col_pick <- function(df, candidates) {
+  if (is.null(df) || !is.data.frame(df)) return(NULL)
+  nm <- names(df)
+  for (c in candidates) if (c %in% nm) return(c)
+  up <- toupper(nm)
+  for (c in candidates) {
+    i <- match(toupper(c), up)
+    if (!is.na(i)) return(nm[[i]])
+  }
+  NULL
+}
+
+.std_uf_metrics <- function(df) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(NULL)
+  c_uf <- .col_pick(df, c("uf","UF","sigla_uf","SIGLA_UF","sg_uf","SG_UF"))
+  if (is.null(c_uf)) return(NULL)
+
+  c_cases <- .col_pick(df, c("casos_total","cases_total","casos","TOTAL_CASOS","qt_casos"))
+  c_new   <- .col_pick(df, c("casos_novos","cases_new","new_cases","casos_novos_total","casos_novos_epi","cases_novos","cases_new_total"))
+  c_obt   <- .col_pick(df, c("casos_obitos","obitos_total","obitos","TOTAL_OBITOS","qt_obitos"))
+  c_cura  <- .col_pick(df, c("casos_cura","cura_total","curas_total","curas","TOTAL_CURAS"))
+  c_pop   <- .col_pick(df, c("pop_total","POP_TOTAL","pop"))
+  c_incid <- .col_pick(df, c("incid_100k_total","incidencia_100k_total","incid_100k","INCID_100K_TOTAL","incid"))
+
+  out <- data.frame(
+    uf = .to_uf(df[[c_uf]]),
+    casos_total  = if (!is.null(c_cases)) suppressWarnings(as.numeric(df[[c_cases]])) else NA_real_,
+    casos_novos  = if (!is.null(c_new))   suppressWarnings(as.numeric(df[[c_new]]))   else NA_real_,
+    casos_obitos = if (!is.null(c_obt))   suppressWarnings(as.numeric(df[[c_obt]]))   else NA_real_,
+    casos_cura   = if (!is.null(c_cura))  suppressWarnings(as.numeric(df[[c_cura]]))  else NA_real_,
+    pop_total    = if (!is.null(c_pop))   suppressWarnings(as.numeric(df[[c_pop]]))   else NA_real_,
+    incid_100k_total = if (!is.null(c_incid)) suppressWarnings(as.numeric(df[[c_incid]])) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  out <- out[!is.na(out$uf) & nzchar(out$uf), , drop = FALSE]
+  miss_new <- !is.finite(out$casos_novos) & is.finite(out$casos_total)
+  if (any(miss_new)) out$casos_novos[miss_new] <- out$casos_total[miss_new]
+  out
+}
+
+.path_ancestors <- function(path, max_up = 10L) {
+  out <- character(0)
+  cur <- normalizePath(path %||% ".", winslash = "/", mustWork = FALSE)
+  for (i in seq_len(max(1L, as.integer(max_up) + 1L))) {
+    out <- c(out, cur)
+    parent <- dirname(cur)
+    if (identical(parent, cur)) break
+    cur <- parent
+  }
+  unique(out)
+}
+
+.find_support_file <- function(filename, cfg = NULL) {
+  cfg <- .res(cfg)
+  cands <- character(0)
+  support_root <- Sys.getenv("SINAN_SUPPORT_ROOT", unset = "")
+  support_root <- if (nzchar(support_root)) normalizePath(support_root, winslash = "/", mustWork = FALSE) else NULL
+
+  if (identical(filename, "fwmalharecife") && !is.null(support_root) && dir.exists(support_root)) {
+    return(support_root)
+  }
+
+  if (!is.null(support_root) && nzchar(filename)) {
+    cands <- c(cands, file.path(support_root, filename))
+  }
+
+  wd <- tryCatch(getwd(), error = function(e) ".")
+  cands <- c(cands, file.path(.path_ancestors(wd, max_up = 10L), filename))
+
+  dash <- .obj_get(cfg, "DASHBOARD_DIR", NULL) %||% .find_dashboard_dir(cfg)
+  if (!is.null(dash) && nzchar(dash)) {
+    cands <- c(cands, file.path(.path_ancestors(dash, max_up = 10L), filename))
+  }
+
+  cands <- unique(normalizePath(cands, winslash = "/", mustWork = FALSE))
+  hit <- cands[file.exists(cands)]
+  if (length(hit) > 0) hit[[1]] else NULL
+}
+
+.name_key <- function(x) {
+  x <- as.character(x %||% "")
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT")
+  x <- toupper(trimws(x))
+  x <- gsub("[^A-Z0-9]+", " ", x)
+  x <- gsub("\\s+", " ", x)
+  ifelse(nzchar(x), x, NA_character_)
+}
+
+.recife_bairro_key <- function(x) {
+  k <- .name_key(x)
+  k[!is.na(k) & k == "BAIRRO DO RECIFE"] <- "RECIFE"
+  k[!is.na(k) & k == "POCO DA PANELA"] <- "POCO"
+  k
+}
+
+.read_pe_municipios_lookup <- function(cfg = NULL) {
+  path <- .find_support_file("municipios.csv", cfg = cfg)
+  if (is.null(path)) return(NULL)
+
+  tries <- c("UTF-8", "Latin1", "windows-1252")
+  df <- NULL
+  for (enc in tries) {
+    df_try <- tryCatch(
+      read.csv(path, stringsAsFactors = FALSE, fileEncoding = enc, check.names = FALSE),
+      error = function(e) NULL
+    )
+    if (is.data.frame(df_try) && nrow(df_try) > 0) {
+      df <- df_try
+      break
+    }
+  }
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(NULL)
+
+  c_city  <- .col_pick(df, c("City", "city", "cod_mun7", "CD_MUN", "cd_mun"))
+  c_name  <- .col_pick(df, c("Name", "name", "nome", "Nome"))
+  c_macro <- .col_pick(df, c("NomeMacro", "nome_macro", "macro", "MACRO"))
+  c_micro <- .col_pick(df, c("NomeRegSau", "nome_regsau", "micro", "MICRO"))
+  if (is.null(c_city) || is.null(c_macro) || is.null(c_micro)) return(NULL)
+
+  out <- data.frame(
+    cod_mun7 = .to_mun7(df[[c_city]]),
+    nome_mun = if (!is.null(c_name)) as.character(df[[c_name]]) else NA_character_,
+    nome_macro = trimws(as.character(df[[c_macro]])),
+    nome_micro = trimws(as.character(df[[c_micro]])),
+    stringsAsFactors = FALSE
+  )
+  out <- out[!is.na(out$cod_mun7) & nzchar(out$cod_mun7), , drop = FALSE]
+  out$nome_mun[is.na(out$nome_mun)] <- out$cod_mun7[is.na(out$nome_mun)]
+  out$macro_key <- .name_key(out$nome_macro)
+  out$micro_key <- .name_key(out$nome_micro)
+  out$search_label <- ifelse(
+    nzchar(out$nome_micro %||% ""),
+    paste0(out$nome_mun, " - ", out$nome_micro),
+    out$nome_mun
+  )
+  out <- out[!duplicated(out$cod_mun7), , drop = FALSE]
+  out
+}
+
+.read_pe_region_sf <- function(filename, region_col, cfg = NULL) {
+  path <- .find_support_file(filename, cfg = cfg)
+  if (is.null(path)) return(NULL)
+  g <- .st_read_quiet(path)
+  g <- .sf_fix_for_leaflet(g)
+  if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) return(NULL)
+
+  if (!region_col %in% names(g)) {
+    alt <- .col_pick(as.data.frame(sf::st_drop_geometry(g)), c(region_col, tolower(region_col), toupper(region_col)))
+    if (!is.null(alt)) g[[region_col]] <- g[[alt]]
+  }
+  if (!region_col %in% names(g)) return(NULL)
+
+  g$region_name <- trimws(as.character(g[[region_col]]))
+  g$region_key <- .name_key(g$region_name)
+  g <- g[!is.na(g$region_key) & nzchar(g$region_key), , drop = FALSE]
+  g <- .simplify_sf(g, denom = 1200, preserve = TRUE)
+  .sf_fix_for_leaflet(g)
+}
+
+.read_pe_municipios_sf <- function(cfg = NULL) {
+  path <- .find_support_file("PE MODIF.shp", cfg = cfg)
+  if (is.null(path)) path <- .find_support_file("PE MODIF.geojson", cfg = cfg)
+  if (is.null(path)) return(NULL)
+
+  g <- .st_read_quiet(path)
+  g <- .sf_fix_for_leaflet(g)
+  if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) return(NULL)
+
+  attrs <- as.data.frame(sf::st_drop_geometry(g))
+
+  c_id <- .col_pick(attrs, c("City", "city", "cod_mun7", "COD_MUN7", "CD_MUN", "cd_mun", "geo_id", "GEO_ID"))
+  c_nm <- .col_pick(attrs, c("Name", "name", "nome", "Nome", "nome_mun", "NOME_MUN", "municipio", "MUNICIPIO"))
+
+  g$cod_mun7 <- if (!is.null(c_id)) .to_mun7(attrs[[c_id]]) else NA_character_
+  g$nome_mun <- if (!is.null(c_nm)) as.character(attrs[[c_nm]]) else as.character(g$cod_mun7)
+  g$uf <- "PE"
+  g <- g[!is.na(g$cod_mun7) & nzchar(g$cod_mun7), , drop = FALSE]
+  g <- .simplify_sf(g, denom = 1150, preserve = TRUE)
+  .sf_fix_for_leaflet(g)
+}
+
+.read_recife_shape_layers <- local({
+  cache <- new.env(parent = emptyenv())
+
+  function(cfg = NULL) {
+    # PASSO 4 -- geometria pre-processada.
+    # Se scripts/preparar_geometria.R ja rodou, a malha vem pronta: sem st_read,
+    # sem st_make_valid, sem st_cast, sem st_simplify. Custava ~525 ms por
+    # processo R e o st_simplify em lon/lat nem simplificava. Se o arquivo nao
+    # existir, cai no caminho antigo -- nada quebra por falta dele.
+    pronto <- tryCatch({
+      raiz <- .as_chr1(.obj_get(cfg, "ROOT", NULL), NULL)
+      if (is.null(raiz) || !nzchar(raiz)) NULL
+      else {
+        fp <- file.path(raiz, "data", "geo", "recife_bairros.rds")
+        if (file.exists(fp)) fp else NULL
+      }
+    }, error = function(e) NULL)
+
+    if (!is.null(pronto)) {
+      chave <- paste0("pronto|", pronto, "|", file.info(pronto)$mtime)
+      if (exists(chave, envir = cache, inherits = FALSE)) {
+        return(get(chave, envir = cache, inherits = FALSE))
+      }
+      camadas <- tryCatch(readRDS(pronto), error = function(e) NULL)
+      if (is.list(camadas) && inherits(camadas$bairros, "sf") && nrow(camadas$bairros) > 0) {
+        assign(chave, camadas, envir = cache)
+        return(camadas)
+      }
+    }
+
+    root <- .find_support_file("fwmalharecife", cfg = cfg)
+    if (is.null(root) || !dir.exists(root)) return(list(bairros = NULL, distritos = NULL))
+
+    root <- normalizePath(root, winslash = "/", mustWork = FALSE)
+    files <- list.files(root, pattern = "\\.shp$", full.names = TRUE, ignore.case = TRUE)
+    if (length(files) == 0) return(list(bairros = NULL, distritos = NULL))
+
+    all_files <- list.files(root, full.names = TRUE)
+    mt <- suppressWarnings(max(as.numeric(file.info(all_files)$mtime), na.rm = TRUE))
+    if (!is.finite(mt)) mt <- 0
+    key <- paste0(root, "|", length(files), "|", mt)
+    if (exists(key, envir = cache, inherits = FALSE)) return(get(key, envir = cache, inherits = FALSE))
+
+    layers <- list(bairros = NULL, distritos = NULL)
+
+    for (path in files) {
+      nm_path <- basename(path)
+      if (grepl("logradouro", nm_path, ignore.case = TRUE)) next
+
+      g0 <- .st_read_quiet(path)
+      if (is.null(g0) || !inherits(g0, "sf") || nrow(g0) == 0) next
+
+      attrs <- as.data.frame(sf::st_drop_geometry(g0))
+      bairro_col <- .col_pick(attrs, c("EBAIRRNOME", "BAIRRO", "NOME_BAIRRO", "bairro", "nome_bairro"))
+
+      g <- .sf_fix_for_leaflet(g0)
+      if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) next
+
+      if (!is.null(bairro_col) && is.null(layers$bairros)) {
+        id_col <- .col_pick(attrs, c("CBAIRRCODI", "VBAIRROID", "OBJECTID", "ID", "id"))
+        g$shape_name <- trimws(enc2utf8(as.character(g[[bairro_col]])))
+        g$shape_name[is.na(g$shape_name) | !nzchar(g$shape_name)] <- "Bairro nao informado"
+        g$shape_id <- if (!is.null(id_col)) as.character(g[[id_col]]) else as.character(seq_len(nrow(g)))
+        g$shape_id[is.na(g$shape_id) | !nzchar(g$shape_id)] <- as.character(seq_len(nrow(g)))[is.na(g$shape_id) | !nzchar(g$shape_id)]
+        g <- .simplify_sf(g, denom = 2600, preserve = TRUE)
+        layers$bairros <- .sf_fix_for_leaflet(g)
+        next
+      }
+    }
+
+    assign(key, layers, envir = cache)
+    layers
+  }
+})
+
+.num_br <- function(x) {
+  if (is.null(x)) return(numeric(0))
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "NaN", "NULL", "null")] <- NA_character_
+  x <- gsub("\\.", "", x)
+  x <- gsub(",", ".", x, fixed = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+.read_tb_recife_raw <- local({
+  cache <- new.env(parent = emptyenv())
+  want <- c("nu_ano", "latitude", "longitude", "nm_bairro", "dsc_localidade", "address")
+
+  function(cfg = NULL) {
+    dash <- .obj_get(cfg, "DASHBOARD_DIR", NULL) %||% .find_dashboard_dir(cfg)
+    if (is.null(dash) || !nzchar(dash)) return(NULL)
+
+    dir <- file.path(dash, "sinan", "TUBERCULOSE")
+    if (!dir.exists(dir)) return(NULL)
+
+    files <- list.files(dir, pattern = "\\.parquet$", full.names = TRUE)
+    if (length(files) == 0) return(NULL)
+
+    mt <- suppressWarnings(max(as.numeric(file.info(files)$mtime), na.rm = TRUE))
+    if (!is.finite(mt)) mt <- 0
+    key <- paste0(dir, "|", length(files), "|", mt)
+    if (exists(key, envir = cache, inherits = FALSE)) return(get(key, envir = cache, inherits = FALSE))
+
+    parts <- lapply(files, function(fp) {
+      tryCatch({
+        df <- as.data.frame(arrow::read_parquet(fp))
+        have <- intersect(want, names(df))
+        if (length(have) == 0) return(NULL)
+        df <- df[have]
+        for (col in setdiff(want, have)) df[[col]] <- NA_character_
+        df[want]
+      }, error = function(e) NULL)
+    })
+    parts <- parts[!vapply(parts, is.null, logical(1))]
+    if (length(parts) == 0) return(NULL)
+
+    out <- do.call(rbind, parts)
+    if (is.null(out) || nrow(out) == 0) return(NULL)
+
+    assign(key, out, envir = cache)
+    out
+  }
+})
+
+.read_tb_recife_points <- function(cfg = NULL) {
+  raw <- .read_tb_recife_raw(cfg)
+  if (is.null(raw) || nrow(raw) == 0) return(NULL)
+
+  out <- data.frame(
+    ano = suppressWarnings(as.integer(raw$nu_ano)),
+    lat = suppressWarnings(as.numeric(raw$latitude)),
+    lng = suppressWarnings(as.numeric(raw$longitude)),
+    bairro = trimws(as.character(raw$nm_bairro)),
+    localidade = trimws(as.character(raw$dsc_localidade)),
+    endereco = trimws(as.character(raw$address)),
+    stringsAsFactors = FALSE
+  )
+
+  out <- out[
+    is.finite(out$lat) & is.finite(out$lng) &
+      out$lat >= -90 & out$lat <= 90 & out$lng >= -180 & out$lng <= 180,
+    ,
+    drop = FALSE
+  ]
+  if (nrow(out) == 0) return(NULL)
+
+  out$bairro[is.na(out$bairro) | !nzchar(out$bairro)] <- out$localidade[is.na(out$bairro) | !nzchar(out$bairro)]
+  out$bairro[is.na(out$bairro) | !nzchar(out$bairro)] <- "Bairro nao informado"
+  out$endereco[is.na(out$endereco) | !nzchar(out$endereco)] <- "Endereco nao informado"
+
+  out
+}
+
+.read_recife_bairro_incidence <- local({
+  cache <- new.env(parent = emptyenv())
+
+  function(cfg = NULL) {
+    dash <- .obj_get(cfg, "DASHBOARD_DIR", NULL) %||% .find_dashboard_dir(cfg)
+    if (is.null(dash) || !nzchar(dash)) return(NULL)
+
+    dir <- file.path(dash, "incidence", "doenca=TUBERCULOSE", "nivel=BAIRRO")
+    if (!dir.exists(dir)) return(NULL)
+
+    files <- list.files(dir, pattern = "\\.parquet$", recursive = TRUE, full.names = TRUE)
+    if (length(files) == 0) return(NULL)
+
+    mt <- suppressWarnings(max(as.numeric(file.info(files)$mtime), na.rm = TRUE))
+    if (!is.finite(mt)) mt <- 0
+    key <- paste0(dir, "|", length(files), "|", mt)
+    if (exists(key, envir = cache, inherits = FALSE)) return(get(key, envir = cache, inherits = FALSE))
+
+    parts <- lapply(files, function(fp) tryCatch(as.data.frame(arrow::read_parquet(fp)), error = function(e) NULL))
+    parts <- parts[!vapply(parts, is.null, logical(1))]
+    if (length(parts) == 0) return(NULL)
+
+    out <- do.call(rbind, parts)
+    if (is.null(out) || nrow(out) == 0) return(NULL)
+
+    assign(key, out, envir = cache)
+    out
+  }
+})
+
+.read_tb_recife_cases <- function(cfg = NULL) {
+  raw <- .read_recife_bairro_incidence(cfg)
+  if (is.null(raw) || nrow(raw) == 0) return(NULL)
+
+  out <- data.frame(
+    ano = suppressWarnings(as.integer(raw$ano)),
+    localidade_key = as.character(raw$bairro_key),
+    casos_tb = suppressWarnings(as.numeric(raw$casos_total)),
+    pop = suppressWarnings(as.numeric(raw$pop_total)),
+    incid_100k = suppressWarnings(as.numeric(raw$incid_100k_total)),
+    stringsAsFactors = FALSE
+  )
+  out <- out[!is.na(out$localidade_key) & nzchar(out$localidade_key), , drop = FALSE]
+  if (nrow(out) == 0) return(NULL)
+
+  out
+}
+
+.prep_tb_recife_bairro_counts <- function(cases, year = NULL) {
+  if (is.null(cases) || !is.data.frame(cases) || nrow(cases) == 0) return(NULL)
+  if (!"localidade_key" %in% names(cases)) return(NULL)
+
+  yy <- suppressWarnings(as.integer(year))
+  if (length(yy) == 0) yy <- NA_integer_
+  yy <- yy[[1]]
+
+  out <- cases
+  if (is.finite(yy) && "ano" %in% names(out)) {
+    out <- out[suppressWarnings(as.integer(out$ano)) == yy, , drop = FALSE]
+    if (nrow(out) == 0) return(NULL)
+  }
+
+  out
+}
+
+.prep_tb_recife_points <- function(pts, year = NULL) {
+  if (is.null(pts) || !is.data.frame(pts) || nrow(pts) == 0) return(NULL)
+  if (!all(c("lat", "lng") %in% names(pts))) return(NULL)
+
+  yy <- suppressWarnings(as.integer(year))
+  if (length(yy) == 0) yy <- NA_integer_
+  yy <- yy[[1]]
+  if (is.finite(yy) && "ano" %in% names(pts)) {
+    pts <- pts[suppressWarnings(as.integer(pts$ano)) == yy, , drop = FALSE]
+    if (nrow(pts) == 0) return(NULL)
+  }
+
+  pts <- pts[
+    is.finite(pts$lat) & is.finite(pts$lng) &
+      pts$lat >= -8.20 & pts$lat <= -7.90 &
+      pts$lng >= -35.05 & pts$lng <= -34.80,
+    ,
+    drop = FALSE
+  ]
+  if (nrow(pts) == 0) return(NULL)
+
+  pts$lat_key <- round(pts$lat, 6)
+  pts$lng_key <- round(pts$lng, 6)
+
+  out <- pts %>%
+    dplyr::group_by(.data$lat_key, .data$lng_key) %>%
+    dplyr::summarise(n_casos = dplyr::n(), .groups = "drop") %>%
+    dplyr::mutate(
+      lat = .data$lat_key,
+      lng = .data$lng_key,
+      radius = pmin(4.2, 1.15 + log1p(suppressWarnings(as.numeric(.data$n_casos))) * 0.55)
+    ) %>%
+    as.data.frame(stringsAsFactors = FALSE)
+
+  out <- out[is.finite(out$lat) & is.finite(out$lng) & is.finite(out$radius), , drop = FALSE]
+  if (nrow(out) == 0) return(NULL)
+  out
+}
+
+.aggregate_region_metrics <- function(df, lookup, level = c("MACRO", "MICRO")) {
+  lvl <- match.arg(level)
+  df <- .std_mun_metrics(df)
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(data.frame())
+  if (is.null(lookup) || !is.data.frame(lookup) || nrow(lookup) == 0) return(data.frame())
+
+  key_col <- if (identical(lvl, "MACRO")) "macro_key" else "micro_key"
+  name_col <- if (identical(lvl, "MACRO")) "nome_macro" else "nome_micro"
+
+  joined <- tryCatch(dplyr::left_join(df, lookup, by = "cod_mun7"), error = function(e) NULL)
+  if (is.null(joined) || !is.data.frame(joined) || nrow(joined) == 0) return(data.frame())
+  joined <- joined[!is.na(joined[[key_col]]) & nzchar(joined[[key_col]]), , drop = FALSE]
+  if (nrow(joined) == 0) return(data.frame())
+
+  out <- joined %>%
+    dplyr::group_by(.data[[key_col]], .data[[name_col]]) %>%
+    dplyr::summarise(
+      casos_total = sum(.data$casos_total, na.rm = TRUE),
+      casos_novos = sum(.data$casos_novos, na.rm = TRUE),
+      casos_obitos = sum(.data$casos_obitos, na.rm = TRUE),
+      casos_cura = sum(.data$casos_cura, na.rm = TRUE),
+      pop_total = sum(.data$pop_total, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  names(out)[names(out) == key_col] <- "region_key"
+  names(out)[names(out) == name_col] <- "region_name"
+  out$incid_100k_total <- ifelse(
+    is.finite(out$pop_total) & out$pop_total > 0,
+    (out$casos_total / out$pop_total) * 1e5,
+    NA_real_
+  )
+  out
+}
+
+.std_mun_metrics <- function(df) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(NULL)
+  c_id <- .col_pick(df, c("cod_mun7","COD_MUN7","geo_id","GEO_ID","CD_MUN","cd_mun","mun","MUN","id"))
+  if (is.null(c_id)) return(NULL)
+
+  c_uf   <- .col_pick(df, c("uf","UF","sigla_uf","SIGLA_UF","sg_uf","SG_UF"))
+  c_nm   <- .col_pick(df, c("nome_mun","NOME_MUN","geo_nome","GEO_NOME","nm_mun","NM_MUN","municipio","MUNICIPIO","nome"))
+
+  c_cases <- .col_pick(df, c("casos_total","cases_total","casos","TOTAL_CASOS","qt_casos"))
+  c_new   <- .col_pick(df, c("casos_novos","cases_new","new_cases","casos_novos_total","casos_novos_epi","cases_novos","cases_new_total"))
+  c_obt   <- .col_pick(df, c("casos_obitos","obitos_total","obitos","TOTAL_OBITOS","qt_obitos"))
+  c_cura  <- .col_pick(df, c("casos_cura","cura_total","curas_total","curas","TOTAL_CURAS"))
+  c_pop   <- .col_pick(df, c("pop_total","POP_TOTAL","pop"))
+  c_incid <- .col_pick(df, c("incid_100k_total","incidencia_100k_total","incid_100k","INCID_100K_TOTAL","incid"))
+
+  out <- data.frame(
+    cod_mun7 = .to_mun7(df[[c_id]]),
+    uf = if (!is.null(c_uf)) .to_uf(df[[c_uf]]) else NA_character_,
+    nome_mun = if (!is.null(c_nm)) as.character(df[[c_nm]]) else NA_character_,
+    casos_total  = if (!is.null(c_cases)) suppressWarnings(as.numeric(df[[c_cases]])) else NA_real_,
+    casos_novos  = if (!is.null(c_new))   suppressWarnings(as.numeric(df[[c_new]]))   else NA_real_,
+    casos_obitos = if (!is.null(c_obt))   suppressWarnings(as.numeric(df[[c_obt]]))   else NA_real_,
+    casos_cura   = if (!is.null(c_cura))  suppressWarnings(as.numeric(df[[c_cura]]))  else NA_real_,
+    pop_total    = if (!is.null(c_pop))   suppressWarnings(as.numeric(df[[c_pop]]))   else NA_real_,
+    incid_100k_total = if (!is.null(c_incid)) suppressWarnings(as.numeric(df[[c_incid]])) else NA_real_,
+    stringsAsFactors = FALSE
+  )
+  out <- out[!is.na(out$cod_mun7) & nzchar(out$cod_mun7), , drop = FALSE]
+  miss_new <- !is.finite(out$casos_novos) & is.finite(out$casos_total)
+  if (any(miss_new)) out$casos_novos[miss_new] <- out$casos_total[miss_new]
+  out
+}
+
+# =============================================================================
+# UI
+# =============================================================================
+mod_map_ui <- function(id, cfg = NULL, pack = NULL, ...) {
+  ns <- NS(id)
+
+  pack_obj <- if (is.function(pack)) tryCatch(pack(), error = function(e) NULL) else pack
+  cfg_obj <- if (is.function(cfg)) tryCatch(cfg(), error = function(e) NULL) else cfg
+  doenca_ui <- toupper(trimws(as.character(
+    .obj_get(pack_obj, "DOENCA", NULL) %||% .obj_get(cfg_obj, "DOENCA", NULL) %||% ""
+  )))
+  show_help_ui <- doenca_ui %in% c("TUBERCULOSE", "TB", "TUBERCULOSIS")
+  lock_recife <- isTRUE(.obj_get(cfg_obj, "LOCK_RECIFE", FALSE) %||% .obj_get(cfg_obj, "lock_recife", FALSE))
+
+  .help_text <- function(lines) {
+    lines <- as.character(lines %||% character(0))
+    paste0("<div class='sinan-help-text'>", paste(lines, collapse = "<br>"), "</div>")
+  }
+
+  .help_badge <- function(label, tip_html = label) {
+    tags$span(
+      class = "sinan-help-badge",
+      title = label,
+      `aria-label` = label,
+      `data-bs-toggle` = "tooltip",
+      `data-bs-title` = tip_html,
+      `data-bs-html` = "true",
+      `data-bs-custom-class` = "sinan-help-tooltip",
+      `data-bs-placement` = "top",
+      "i"
+    )
+  }
+
+  id_busy <- ns("busy")
+  id_map  <- ns("map")
+  id_region_view <- ns("region_view")
+  id_municipio_search <- ns("municipio_search")
+  id_clear_bairro <- ns("clear_bairro")
+
+  ch_busy_handler   <- ns("busy_handler")
+  ch_map_fit        <- ns("map_fit")
+  ch_map_invalidate <- ns("map_invalidate")
+  ch_map_back_state <- ns("map_back_state")
+  ch_map_bind_hover <- ns("map_bind_hover")
+
+  js <- sprintf(
+"(function(){
+  function getMap(id){
+    try{
+      if(window.__sinanLeafletMaps && window.__sinanLeafletMaps[id]) return window.__sinanLeafletMaps[id];
+      var w = HTMLWidgets.find('#'+id);
+      if(w && w.getMap){
+        var m = w.getMap();
+        window.__sinanLeafletMaps = window.__sinanLeafletMaps || {};
+        window.__sinanLeafletMaps[id] = m;
+        return m;
+      }
+    }catch(e){}
+    return null;
+  }
+
+  function ensureHoverBox(map){
+    try{
+      if(map._sinanHoverBox) return map._sinanHoverBox;
+      var cont = map.getContainer();
+      var hb = document.createElement('div');
+      hb.className = 'sinan-hoverbox';
+      hb.innerHTML = \"<div class='box'></div>\";
+      cont.appendChild(hb);
+      map._sinanHoverBox = hb;
+
+      function hide(){
+        hb.classList.remove('show');
+        hb.style.transform = 'translate(-9999px,-9999px)';
+      }
+      map.on('movestart zoomstart dragstart', hide);
+      map.on('mouseout', hide);
+      hb._sinanHide = hide;
+      return hb;
+    }catch(e){ return null; }
+  }
+
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+
+  function positionHover(map, hb, evt){
+    try{
+      if(!hb || !evt) return;
+      var cont = map.getContainer();
+      var box  = hb.querySelector('.box');
+      var oe = evt.originalEvent || evt;
+      if(!oe) return;
+
+      var p = map.mouseEventToContainerPoint(oe);
+
+      // preferencial: acima do mouse e um pouco à direita
+      var x = p.x + 14;
+      var y = p.y - 14;
+
+      var cw = cont.clientWidth || 0;
+      var ch = cont.clientHeight || 0;
+      var bw = (box && box.offsetWidth)  ? box.offsetWidth  : 280;
+      var bh = (box && box.offsetHeight) ? box.offsetHeight : 160;
+
+      if(cw > 0 && x + bw + 10 > cw) x = p.x - bw - 14;
+      if(ch > 0 && y - bh - 10 < 0)  y = p.y + 14;
+
+      x = clamp(x, 8, Math.max(8, cw - bw - 8));
+      y = clamp(y, 8, Math.max(8, ch - bh - 8));
+
+      hb.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+    }catch(e){}
+  }
+
+  //  ROBUST: tenta múltiplas fontes (popup oculto > feature.properties)
+  function extractTipHtml(layer){
+    try{
+      // 1) popup (storage) — funciona mesmo sem feature.properties
+      if(layer && typeof layer.getPopup === 'function'){
+        var pp = layer.getPopup();
+        if(pp && typeof pp.getContent === 'function'){
+          var c = pp.getContent();
+          if(c) return c;
+        }
+      }
+      // 2) feature.properties (quando existe)
+      if(layer && layer.feature && layer.feature.properties){
+        var p = layer.feature.properties;
+        return p.tip_html || p.label_html || p.tooltip || null;
+      }
+    }catch(e){}
+    return null;
+  }
+
+  function bindLayer(map, layer){
+    try{
+      if(!map || !layer) return;
+      if(layer._sinanHoverBound) return;
+      if(typeof layer.on !== 'function') return;
+
+      var html = extractTipHtml(layer);
+      if(!html) return;
+
+      var hb = ensureHoverBox(map);
+      if(!hb) return;
+      var box = hb.querySelector('.box');
+      if(!box) return;
+
+      function show(e){
+        try{
+          var h = extractTipHtml(layer) || html;
+          if(!h) return;
+          box.innerHTML = h;
+          hb.classList.add('show');
+          positionHover(map, hb, e);
+        }catch(err){}
+      }
+      function move(e){ positionHover(map, hb, e); }
+      function hide(){ if(hb && hb._sinanHide) hb._sinanHide(); }
+
+      layer.on('mouseover', show);
+      layer.on('mousemove', move);
+      layer.on('mouseout', hide);
+
+      // touch-friendly: tap mostra, segundo tap esconde
+      layer.on('click', function(e){
+        try{
+          var shown = hb.classList.contains('show');
+          if(!shown){ show(e); }
+          else{ hide(); }
+        }catch(err){}
+      });
+
+      layer._sinanHoverBound = true;
+    }catch(err){}
+  }
+
+  function bindAll(map){
+    try{
+      if(!map) return;
+      ensureHoverBox(map);
+      Object.keys(map._layers || {}).forEach(function(k){
+        var lyr = map._layers[k];
+        if(!lyr) return;
+        if(lyr.eachLayer){
+          lyr.eachLayer(function(ch){ bindLayer(map, ch); });
+        } else {
+          bindLayer(map, lyr);
+        }
+      });
+    }catch(e){}
+  }
+
+  function attach(map){
+    try{
+      if(!map) return;
+      if(map._sinanHoverAttached) return;
+      map._sinanHoverAttached = true;
+
+      ensureHoverBox(map);
+      bindAll(map);
+
+      map.on('layeradd', function(e){
+        try{
+          var lyr = e && e.layer ? e.layer : null;
+          if(!lyr) return;
+          if(lyr.eachLayer){
+            lyr.eachLayer(function(ch){ bindLayer(map, ch); });
+          } else {
+            bindLayer(map, lyr);
+          }
+        }catch(err){}
+      });
+
+      map.on('zoomend moveend', function(){ try{ bindAll(map); }catch(e){} });
+    }catch(e){}
+  }
+
+  window.__sinanMapHover = window.__sinanMapHover || {};
+  window.__sinanMapHover.bindAll = bindAll;
+  window.__sinanMapHover.attach  = attach;
+
+  Shiny.addCustomMessageHandler('%s', function(msg){
+    var el = document.getElementById(msg.id);
+    if(el) el.style.display = msg.show ? 'flex' : 'none';
+  });
+
+  Shiny.addCustomMessageHandler('%s', function(msg){
+    var map = getMap(msg.id);
+    if(!map) return;
+    try{
+      var bb = msg.bb;
+      if(!bb || bb.length !== 4) return;
+      for(var i=0;i<4;i++){ if(bb[i] === null || bb[i] === undefined || isNaN(bb[i])) return; }
+      var b = L.latLngBounds(L.latLng(bb[1], bb[0]), L.latLng(bb[3], bb[2]));
+      var opt = { animate:false };
+      if(msg.maxZoom !== null && msg.maxZoom !== undefined) opt.maxZoom = msg.maxZoom;
+      map.fitBounds(b, opt);
+    }catch(e){}
+  });
+
+  Shiny.addCustomMessageHandler('%s', function(msg){
+    var map = getMap(msg.id);
+    if(!map) return;
+    try{ map.invalidateSize(true); }catch(e){}
+  });
+
+  Shiny.addCustomMessageHandler('%s', function(msg){
+    var map = getMap(msg.map_id);
+    if(!map) return;
+    var btn = map._sinanBackBtn;
+    if(!btn){
+      var el = document.getElementById(msg.map_id);
+      if(el){
+        var root = el.closest('.sinan-map-panel') || el.parentElement;
+        if(root) btn = root.querySelector('.sinan-backbtn');
+      }
+    }
+    if(!btn) return;
+    if(msg.enabled){
+      btn.classList.remove('disabled');
+      btn.style.display = '';
+    } else {
+      btn.classList.add('disabled');
+      btn.style.display = 'none';
+    }
+  });
+
+  Shiny.addCustomMessageHandler('%s', function(msg){
+    var map = getMap(msg.id);
+    if(!map) return;
+    attach(map);
+    bindAll(map);
+  });
+})();",
+    ch_busy_handler,
+    ch_map_fit,
+    ch_map_invalidate,
+    ch_map_back_state,
+    ch_map_bind_hover
+  )
+
+  tagList(
+    tags$head(
+      tags$style(HTML("
+        .sinan-map-panel{height:100%; min-height:620px; width:100%; overflow:hidden; background:transparent !important; border:0 !important; margin-top:-10px;}
+        .sinan-map-panel .card-body,.sinan-map-panel .bslib-card-body{position:relative; height:100%; min-height:0; padding:0; background:transparent !important;}
+
+        /*  FUNDO BRANCO ABSOLUTO */
+        .sinan-map-panel .leaflet.html-widget,
+        .sinan-map-panel .leaflet-container{
+          height:100% !important; width:100% !important;
+          background:#ffffff !important;
+        }
+        .sinan-map-panel .leaflet-map-pane,
+        .sinan-map-panel .leaflet-pane,
+        .sinan-map-panel .leaflet-control-container{
+          background:transparent !important;
+        }
+
+        /*  mata qualquer tile */
+        .sinan-map-panel .leaflet-tile-pane{ display:none !important; }
+        .sinan-map-panel .leaflet-tile{ display:none !important; }
+        .sinan-map-panel .leaflet-control-attribution{ display:none !important; }
+
+        .sinan-map-panel .leaflet-control-container .leaflet-top.leaflet-left{margin-top:6px;}
+        .sinan-map-panel .leaflet-control-container .leaflet-top.leaflet-right{margin-top:6px; margin-right:6px;}
+        .sinan-map-panel .leaflet-top.leaflet-right .info.legend{ margin-top:100px; }
+        .sinan-map-panel .info.legend{
+          padding:14px; border-radius:10px; line-height:24px;
+          box-shadow:0 2px 10px rgba(0,0,0,.12);
+        }
+        .sinan-map-panel .info.legend i{
+          width:16px; height:16px; margin-top:4px; margin-right:12px;
+          border-radius:3px; border:1px solid rgba(0,0,0,.12);
+        }
+        .sinan-quartile-title{font-weight:700; font-size:13px; margin-bottom:4px;}
+        .sinan-quartile-subtitle{font-size:11px; color:#6b7280; margin-bottom:6px;}
+
+        .sinan-map-busy{
+          position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+          background:rgba(255,255,255,.35); backdrop-filter:blur(2px); z-index:9999;
+        }
+        .sinan-map-busy .box{
+          background:rgba(255,255,255,.96); border:1px solid rgba(0,0,0,.08); border-radius:14px;
+          padding:10px 12px; box-shadow:0 6px 20px rgba(0,0,0,.10); font-size:13px; opacity:.95;
+        }
+
+        /*  Popup “storage” oculto (para tooltip robusta) */
+        .sinan-map-toolbar{
+          position:absolute;
+          top:10px;
+          left:52px;
+          right:12px;
+          z-index:9997;
+          display:flex;
+          align-items:flex-start;
+          justify-content:space-between;
+          gap:10px;
+          pointer-events:none;
+        }
+        .sinan-map-toolbar > *{ pointer-events:auto; }
+        .sinan-map-control{
+          background:rgba(255,255,255,.94);
+          border:1px solid rgba(15,23,42,.08);
+          border-radius:14px;
+          box-shadow:0 10px 22px rgba(15,23,42,.10);
+          padding:8px 10px;
+          backdrop-filter:blur(6px);
+        }
+        .sinan-map-level-control{ min-width:320px; }
+        .sinan-map-search-control{ min-width:280px; max-width:360px; width:36%; }
+        .sinan-map-lock{
+          display:flex;
+          align-items:center;
+          gap:12px;
+        }
+        .sinan-map-clear-bairro{
+          margin:0;
+          border:1px solid #1E73BE;
+          border-radius:9px;
+          background:#FFFFFF;
+          color:#12346B;
+          font-size:12px;
+          font-weight:800;
+          line-height:1.2;
+          padding:7px 10px;
+          white-space:nowrap;
+          box-shadow:none;
+        }
+        .sinan-map-clear-bairro:hover,
+        .sinan-map-clear-bairro:focus{
+          border-color:#12346B;
+          background:#EAF2FF;
+          color:#12346B;
+        }
+        .sinan-map-toolbar .form-group{ margin-bottom:0; }
+        .sinan-map-toolbar .control-label{
+          display:block;
+          margin:0 0 6px 0;
+          font-size:11px;
+          font-weight:800;
+          color:#111827;
+        }
+        .sinan-help-badge{
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:16px;
+          height:16px;
+          margin-left:6px;
+          border-radius:999px;
+          background:#0b8a8f;
+          color:#fff;
+          font-size:10px;
+          font-weight:900;
+          line-height:1;
+          cursor:help;
+          vertical-align:middle;
+          box-shadow:0 4px 10px rgba(11,138,143,.35);
+        }
+        .sinan-help-tooltip .tooltip-inner{
+          background:#fff !important;
+          color:#000 !important;
+          font-weight:800 !important;
+          border:1px solid rgba(0,0,0,.18);
+          box-shadow:0 12px 26px rgba(0,0,0,.18);
+          max-width:460px;
+          text-align:left;
+          padding:10px 12px;
+        }
+        .sinan-help-tooltip .tooltip-arrow::before{ border-top-color:#fff !important; }
+        .sinan-help-text{
+          font-size:12px;
+          line-height:1.3;
+          font-weight:800;
+        }
+        .sinan-map-toolbar .shiny-options-group{
+          display:flex;
+          flex-wrap:wrap;
+          gap:8px;
+        }
+        .sinan-map-toolbar .radio-inline{
+          margin:0;
+          padding:0;
+          font-size:12px;
+          font-weight:700;
+          color:#1f2937;
+        }
+        .sinan-map-toolbar .radio-inline input{ margin-right:4px; }
+        .sinan-map-toolbar .selectize-input,
+        .sinan-map-toolbar .selectize-dropdown{ font-size:12px; }
+        .sinan-map-toolbar .selectize-input{
+          min-height:38px;
+          border-radius:10px;
+          border-color:rgba(15,23,42,.12);
+          box-shadow:none;
+        }
+        @media (max-width: 900px){
+          .sinan-map-toolbar{
+            left:12px;
+            right:12px;
+            flex-direction:column;
+          }
+          .sinan-map-level-control,
+          .sinan-map-search-control{
+            width:100%;
+            min-width:0;
+            max-width:none;
+          }
+        }
+
+        .sinan-hidden-popup{ display:none !important; }
+
+        /*  HOVER TOOLTIP (overlay único) */
+        .sinan-hoverbox{
+          position:absolute;
+          z-index:9998;
+          pointer-events:none;
+          transform:translate(-9999px,-9999px);
+          opacity:0;
+          transition:opacity .08s ease-out, transform 0s;
+          will-change: transform, opacity;
+        }
+        .sinan-hoverbox.show{ opacity:1; }
+        .sinan-hoverbox .box{
+          background:rgba(17,24,39,.96);
+          color:#fff;
+          border:1px solid rgba(255,255,255,.10);
+          border-radius:14px;
+          box-shadow:0 10px 22px rgba(0,0,0,.26);
+          padding:8px 10px;
+          max-width:320px;
+          min-width:220px;
+          white-space:normal;
+        }
+        .sinan-tip-scroll{max-height:170px; overflow:auto; padding-right:2px;}
+        .sinan-tip-hdr{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px;}
+        .sinan-tip-title{font-weight:900; font-size:12.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:210px;}
+        .sinan-tip-sub{font-weight:800; font-size:11px; opacity:.85; white-space:nowrap;}
+        .sinan-tip-row{display:flex; align-items:center; justify-content:space-between; gap:10px; font-size:11.5px; line-height:1.25;}
+        .sinan-tip-l{display:flex; align-items:center; gap:8px; min-width:0;}
+        .sinan-tip-dot{width:7px;height:7px;border-radius:999px; flex:0 0 7px; opacity:.95;}
+        .sinan-tip-k{opacity:.86; white-space:nowrap;}
+        .sinan-tip-v{font-weight:900; white-space:nowrap;}
+        .sinan-tip-sp{height:4px;}
+
+        .sinan-backctrl{ background:transparent; }
+        .sinan-backbtn{
+          user-select:none;
+          width:34px; height:34px;
+          display:flex; align-items:center; justify-content:center;
+          border-radius:10px;
+          background:rgba(255,255,255,.92);
+          border:1px solid rgba(0,0,0,.10);
+          box-shadow:0 10px 22px rgba(0,0,0,.12);
+          font-weight:900; cursor:pointer;
+        }
+        .sinan-backbtn.disabled{ opacity:.45; cursor:default; }
+
+        .sinan-legend-counts{
+          background:rgba(255,255,255,.96);
+          border:1px solid rgba(0,0,0,.08);
+          border-radius:10px;
+          padding:8px 10px;
+          box-shadow:0 8px 18px rgba(0,0,0,.10);
+          font-size:11.5px;
+          line-height:1.2;
+          margin-top:0;
+          margin-bottom:6px;
+        }
+        .sinan-legend-counts-title{font-weight:800; margin-bottom:6px; font-size:11.5px;}
+        .sinan-legend-counts table{border-collapse:collapse; width:100%;}
+        .sinan-legend-counts th,
+        .sinan-legend-counts td{padding:2px 4px; text-align:left; white-space:nowrap;}
+        .sinan-legend-counts th{font-weight:800; font-size:11px; opacity:.9;}
+        .sinan-legend-counts td:last-child,
+        .sinan-legend-counts th:last-child{text-align:right;}
+        .sinan-legend-counts tr.na td{opacity:.75;}
+      ")),
+      tags$script(HTML(js)),
+      tags$script(HTML("(function(){
+        function initTooltips(){
+          try{
+            if(!window.bootstrap || !window.bootstrap.Tooltip) return;
+            var nodes = document.querySelectorAll('[data-bs-toggle=\\\"tooltip\\\"]');
+            nodes.forEach(function(el){
+              try{ window.bootstrap.Tooltip.getOrCreateInstance(el); }catch(e){}
+            });
+          }catch(e){}
+        }
+        setTimeout(initTooltips, 0);
+      })();"))
+    ),
+    bslib::card(
+      class = "shadow-sm sinan-map-panel",
+      bslib::card_body(
+        div(
+          class = "sinan-map-toolbar",
+          if (isTRUE(lock_recife)) {
+            div(
+              class = "sinan-map-control sinan-map-lock",
+              actionButton(
+                inputId = id_clear_bairro,
+                label = "Ver Recife inteiro",
+                icon = icon("city"),
+                class = "sinan-map-clear-bairro",
+                title = "Remover a selecao do bairro e mostrar os dados de toda a cidade"
+              )
+            )
+          } else {
+            tagList(
+              div(
+                class = "sinan-map-control sinan-map-level-control",
+                radioButtons(
+                  inputId = id_region_view,
+                  label = if (show_help_ui) {
+                    tagList(
+                      "Nivel do mapa",
+                      .help_badge(
+                        label = "Ajuda de interacao do mapa",
+                        tip_html = .help_text(c(
+                          "Clique em uma area para detalhar a regiao selecionada.",
+                          "Use o nivel para alternar Municipios, Microrregiao e Macrorregiao.",
+                          "A selecao no mapa atualiza os graficos automaticamente.",
+                          "Use a seta de voltar para retornar ao nivel anterior."
+                        ))
+                      )
+                    )
+                  } else {
+                    "Nivel do mapa"
+                  },
+                  choices = c("Municipios" = "MUN", "Microrregiao" = "MICRO", "Macrorregiao" = "MACRO"),
+                  selected = "MUN",
+                  inline = TRUE
+                )
+              ),
+              div(
+                class = "sinan-map-control sinan-map-search-control",
+                selectizeInput(
+                  inputId = id_municipio_search,
+                  label = if (show_help_ui) {
+                    tagList(
+                      "Buscar municipio de Pernambuco",
+                      .help_badge(
+                        label = "Ajuda de busca no mapa",
+                        tip_html = .help_text(c(
+                          "Digite o nome para localizar rapidamente um municipio.",
+                          "Selecione uma opcao da lista para centralizar o mapa.",
+                          "Clique no poligono para fixar o foco da area.",
+                          "KPIs e graficos passam a refletir a area escolhida."
+                        ))
+                      )
+                    )
+                  } else {
+                    "Buscar municipio de Pernambuco"
+                  },
+                  choices = NULL,
+                  selected = NULL,
+                  options = list(
+                    placeholder = "Digite ou selecione um municipio",
+                    create = FALSE,
+                    maxOptions = 185
+                  )
+                )
+              )
+            )
+          }
+        ),
+        div(id = id_busy, class = "sinan-map-busy", div(class = "box", "Carregando")),
+        leafletOutput(id_map, height = "100%")
+      )
+    )
+  )
+}
+
+# =============================================================================
+# SERVER
+# =============================================================================
+mod_map_server <- function(
+  id,
+  ...,
+  cfg = NULL,
+  pack = NULL,
+  state = NULL,
+  data = NULL,
+  nav = NULL,
+  ano = NULL,
+  metric = NULL,
+  data_api = NULL
+) {
+  dots <- list(...)
+  if (is.null(cfg) && !is.null(dots$cfg)) cfg <- dots$cfg
+  if (is.null(pack) && !is.null(dots$pack)) pack <- dots$pack
+  if (is.null(state) && !is.null(dots$state)) state <- dots$state
+  if (is.null(nav) && !is.null(dots$nav)) nav <- dots$nav
+  if (is.null(data) && !is.null(dots$data)) data <- dots$data
+  if (is.null(data_api) && !is.null(dots$data_api)) data_api <- dots$data_api
+  if (is.null(data_api)) data_api <- data
+
+  moduleServer(id, function(input, output, session) {
+
+    cfg  <- .res(cfg)
+    pack <- .res(pack)
+    lock_recife <- isTRUE(.obj_get(cfg, "LOCK_RECIFE", FALSE) %||% .obj_get(cfg, "lock_recife", FALSE))
+    lock_mun7 <- .to_mun7(.obj_get(cfg, "RECIFE_MUN7", NULL) %||% .obj_get(cfg, "recife_mun7", NULL) %||% "2611606")
+    lock_uf <- .to_uf(.obj_get(cfg, "RECIFE_UF", NULL) %||% .obj_get(cfg, "recife_uf", NULL) %||% "PE")
+    doenca_map <- toupper(trimws(as.character(
+      .obj_get(pack, "DOENCA", NULL) %||% .obj_get(cfg, "DOENCA", NULL) %||% ""
+    )))
+    is_tb_map <- doenca_map %in% c("TUBERCULOSE", "TUBERCULOSIS", "TB", "TUB")
+    recife_only_map <- TRUE
+
+    .local_arrow_perf_defaults()
+
+    .sinan_log_open(session = session, cfg = cfg, pack = pack)
+    logw <- function(section, ...) .sinan_log_write(paste0("map.", section), ..., session = session)
+
+    show_busy <- function(x) {
+      session$sendCustomMessage(session$ns("busy_handler"), list(id = session$ns("busy"), show = isTRUE(x)))
+    }
+
+    .bind_hover_now <- function() {
+      session$sendCustomMessage(session$ns("map_bind_hover"), list(id = session$ns("map")))
+      invisible(NULL)
+    }
+
+    # ----------------------------
+    # API 
+    # ----------------------------
+    .resolve_api <- function() {
+      api1 <- .res(data_api); if (!is.null(api1)) return(api1)
+      api2 <- .res(.obj_get(state, "data_api", NULL)); if (!is.null(api2)) return(api2)
+      api3 <- .res(.obj_get(state, "data", NULL)); if (!is.null(api3)) return(api3)
+      api4 <- .res(.obj_get(pack, "data_api", NULL)); if (!is.null(api4)) return(api4)
+      api5 <- .res(.obj_get(pack, "data", NULL)); if (!is.null(api5)) return(api5)
+      NULL
+    }
+    .safe_call <- function(fun, ...) tryCatch(fun(...), error = function(e) e)
+    .tb_grau_filter <- function() {
+      x <- .obj_get(nav, "tb_grau_incapacidade", NULL) %||% .obj_get(state, "tb_grau_incapacidade", NULL)
+      if (is.null(x) || !is.list(x) || is.null(x$value) || is.null(x$var)) return(NULL)
+      if (!nzchar(as.character(x$value)) || identical(as.character(x$value), "__ALL__")) return(NULL)
+      x
+    }
+    .tb_grau_args <- function() {
+      x <- .tb_grau_filter()
+      if (is.null(x)) list() else list(tb_grau_incapacidade = x, grau_incapacidade = x)
+    }
+    .safe_get <- function(name, ...) {
+      api <- .resolve_api()
+      if (is.null(api)) return(NULL)
+      args <- c(list(...), .tb_grau_args())
+      if (is.list(api) && is.function(api[[name]])) {
+        r <- do.call(.safe_call, c(list(api[[name]]), args))
+        if (inherits(r, "error")) { logw("api_error", paste0(name, "(): ", r$message)); return(NULL) }
+        return(r)
+      }
+      if (is.environment(api) && exists(name, envir = api, inherits = FALSE)) {
+        fun <- get(name, envir = api, inherits = FALSE)
+        if (is.function(fun)) {
+          r <- do.call(.safe_call, c(list(fun), args))
+          if (inherits(r, "error")) { logw("api_error", paste0(name, "(): ", r$message)); return(NULL) }
+          return(r)
+        }
+      }
+      NULL
+    }
+
+    # ----------------------------
+    # Debug / diag
+    # ----------------------------
+    .debug_enabled <- function() {
+      isTRUE(getOption("SINAN_DEBUG_MAP", FALSE)) ||
+        isTRUE(.obj_get(cfg, "DEBUG_MAP", FALSE)) ||
+        isTRUE(.obj_get(cfg, "SINAN_DEBUG_MAP", FALSE))
+    }
+    .log_debug <- function(...) {
+      if (!.debug_enabled()) return(invisible(NULL))
+      msg <- paste0("[MAP] ", paste0(..., collapse = " "))
+      message(msg)
+      invisible(NULL)
+    }
+
+    .map_diag_id <- "sinan_map_diag"
+    .map_diag_html <- function(lines) {
+      txt <- paste0(lines, collapse = "<br/>")
+      paste0(
+        "<div style='background:rgba(255,255,255,.92);border:1px solid rgba(0,0,0,.10);",
+        "border-radius:12px;box-shadow:0 10px 22px rgba(0,0,0,.10);padding:8px 10px;",
+        "font-size:12px;line-height:1.25;max-width:460px;'>",
+        "<div style='font-weight:900;margin-bottom:4px;'>Diagnóstico do Mapa</div>",
+        "<div style='font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;'>",
+        txt,
+        "</div></div>"
+      )
+    }
+    .map_set_diag <- function(proxy, lines, position = "bottomleft") {
+      if (is.null(proxy) || !.debug_enabled()) return(invisible(NULL))
+      try(proxy %>% leaflet::removeControl(.map_diag_id), silent = TRUE)
+      try(proxy %>% leaflet::addControl(
+        html = htmltools::HTML(.map_diag_html(lines)),
+        position = position,
+        layerId = .map_diag_id
+      ), silent = TRUE)
+      invisible(NULL)
+    }
+
+    get_level  <- function() .pick_scalar(.obj_get(state, "level", NULL) %||% .obj_get(nav, "level", NULL), "UF")
+    get_uf     <- function() .pick_scalar(.obj_get(state, "uf", NULL)    %||% .obj_get(nav, "uf", NULL), "PE")
+    get_mun    <- function() .pick_scalar(.obj_get(state, "mun", NULL)   %||% .obj_get(nav, "mun", NULL), NULL)
+    get_region_view <- function() {
+      rv <- toupper(as.character(nav$region_view %||% input$region_view %||% "MUN"))
+      if (!rv %in% c("MUN", "MICRO", "MACRO")) rv <- "MUN"
+      rv
+    }
+    get_selected_macro <- function() nav$selected_macro %||% NULL
+    get_selected_micro <- function() nav$selected_micro %||% NULL
+    get_selected_bairro_key <- function() {
+      key <- as.character(
+        .obj_get(nav, "selected_bairro_key", NULL) %||%
+          .obj_get(state, "selected_bairro_key", NULL) %||% ""
+      )
+      if (length(key) > 0 && nzchar(key[[1]])) key[[1]] else NULL
+    }
+
+    .send_back_state <- function(enabled) {
+      session$sendCustomMessage(
+        session$ns("map_back_state"),
+        list(map_id = session$ns("map"), enabled = isTRUE(enabled))
+      )
+      invisible(NULL)
+    }
+
+    .is_mutable <- function(x) inherits(x, "reactivevalues") || is.environment(x)
+    set_level <- function(x) { if (.is_mutable(nav)) .obj_set(nav, "level", x); .obj_set(state, "level", x); .obj_set(state, "_map_tick", Sys.time()); invisible(NULL) }
+    set_uf    <- function(x) { if (.is_mutable(nav)) .obj_set(nav, "uf", x);    .obj_set(state, "uf", x);    .obj_set(state, "_map_tick", Sys.time()); invisible(NULL) }
+    set_mun   <- function(x) { if (.is_mutable(nav)) .obj_set(nav, "mun", x);   .obj_set(state, "mun", x);   .obj_set(state, "_map_tick", Sys.time()); invisible(NULL) }
+    .radio_programmatic <- reactiveVal(FALSE)
+    set_region_view <- function(x) {
+      if (isTRUE(lock_recife)) {
+        if (.is_mutable(nav)) nav$region_view <- "MUN"
+        .obj_set(state, "_map_tick", Sys.time())
+        return(invisible(NULL))
+      }
+      rv <- toupper(as.character(x %||% "MUN"))
+      if (!rv %in% c("MUN", "MICRO", "MACRO")) rv <- "MUN"
+      if (.is_mutable(nav)) nav$region_view <- rv
+      .radio_programmatic(TRUE)
+      updateRadioButtons(session, "region_view", selected = rv)
+      .obj_set(state, "_map_tick", Sys.time())
+      invisible(NULL)
+    }
+    set_selected_macro <- function(x) { if (.is_mutable(nav)) nav$selected_macro <- x; .obj_set(state, "_map_tick", Sys.time()); invisible(NULL) }
+    set_selected_micro <- function(x) { if (.is_mutable(nav)) nav$selected_micro <- x; .obj_set(state, "_map_tick", Sys.time()); invisible(NULL) }
+    set_selected_bairro <- function(key = NULL, name = NULL) {
+      key <- as.character(key %||% "")
+      name <- as.character(name %||% "")
+      key <- if (length(key) > 0 && nzchar(key[[1]])) key[[1]] else NULL
+      name <- if (length(name) > 0 && nzchar(name[[1]])) name[[1]] else NULL
+
+      if (.is_mutable(nav)) {
+        .obj_set(nav, "selected_bairro_key", key)
+        .obj_set(nav, "selected_bairro_name", name)
+        .obj_set(nav, "_map_tick", Sys.time())
+      }
+      if (!identical(state, nav)) {
+        .obj_set(state, "selected_bairro_key", key)
+        .obj_set(state, "selected_bairro_name", name)
+        .obj_set(state, "_map_tick", Sys.time())
+      }
+      if (isTRUE(lock_recife)) .send_back_state(!is.null(key))
+      invisible(NULL)
+    }
+
+    apply_recife_lock <- function() {
+      if (!isTRUE(lock_recife)) return(invisible(NULL))
+      set_level("MUN")
+      set_uf(lock_uf)
+      set_mun(lock_mun7)
+      set_region_view("MUN")
+      set_selected_macro(NULL)
+      set_selected_micro(NULL)
+      invisible(NULL)
+    }
+
+    if (is.null(.obj_get(state, "level", NULL)))  .obj_set(state, "level", "UF")
+    if (is.null(.obj_get(state, "uf", NULL)))  .obj_set(state, "uf", "PE")
+    if (is.null(.obj_get(state, "metric", NULL))) .obj_set(state, "metric", "incid")
+
+    if (isTRUE(lock_recife)) {
+      apply_recife_lock()
+      observe({
+        lv <- toupper(as.character(get_level() %||% "MUN"))
+        uf <- .to_uf(get_uf())
+        mun <- .to_mun7(get_mun())
+        rv <- toupper(as.character(nav$region_view %||% "MUN"))
+        if (!identical(lv, "MUN") || !identical(uf, lock_uf) || !identical(mun, lock_mun7) || !identical(rv, "MUN")) {
+          apply_recife_lock()
+        }
+      })
+    }
+
+    # Sync radioButtons → nav (only when user manually changes, not programmatic)
+    observeEvent(input$region_view, {
+      if (isTRUE(lock_recife)) return()
+      if (isTRUE(.radio_programmatic())) {
+        .radio_programmatic(FALSE)
+        return()
+      }
+      rv <- toupper(as.character(input$region_view %||% "MUN"))
+      if (!rv %in% c("MUN", "MICRO", "MACRO")) rv <- "MUN"
+      if (.is_mutable(nav)) {
+        nav$region_view    <- rv
+        nav$selected_macro <- NULL
+        nav$selected_micro <- NULL
+      }
+    }, ignoreInit = TRUE)
+
+    observe({
+      aext <- .res(ano)
+      if (is.function(aext)) {
+        y <- suppressWarnings(as.integer(aext()))
+        if (is.finite(y)) .obj_set(state, "ano", y)
+      }
+    })
+    observe({
+      mext <- .res(metric)
+      if (is.function(mext)) {
+        m <- as.character(mext() %||% "incid")
+        if (!m %in% c("incid", "cases", "obitos", "cura", "pop")) m <- "incid"
+        .obj_set(state, "metric", m)
+      }
+    })
+
+    mun_sf_cache  <- new.env(parent = emptyenv())
+    join_cache    <- new.env(parent = emptyenv())
+
+    .get_geo_mun_for_uf <- function(uf) {
+      u <- .to_uf(uf)
+      if (is.na(u) || !nzchar(u)) return(NULL)
+      if (exists(u, envir = mun_sf_cache, inherits = FALSE)) return(get(u, envir = mun_sf_cache, inherits = FALSE))
+
+      g <- NULL
+      if (identical(u, "PE")) {
+        g <- .read_pe_municipios_sf(cfg)
+      }
+
+      g <- .sf_fix_for_leaflet(g)
+      g <- .simplify_sf(g, denom = 1150, preserve = TRUE)
+      g <- .sf_fix_for_leaflet(g)
+
+      assign(u, g, envir = mun_sf_cache)
+      g
+    }
+
+    pe_lookup <- .read_pe_municipios_lookup(cfg)
+    pe_macro_sf <- .read_pe_region_sf("PEMacSAUD MODIF.geojson", "NomeMacro", cfg = cfg)
+    pe_micro_sf <- .read_pe_region_sf("PERGSAUDE MODIF.geojson", "NomeRegSau", cfg = cfg)
+
+    if (!is.null(pe_macro_sf) && inherits(pe_macro_sf, "sf") && nrow(pe_macro_sf) > 0) {
+      pe_macro_sf$nome_macro <- pe_macro_sf$region_name
+    }
+    if (!is.null(pe_micro_sf) && inherits(pe_micro_sf, "sf") && nrow(pe_micro_sf) > 0) {
+      pe_micro_sf$nome_micro <- pe_micro_sf$region_name
+    }
+
+    session$onFlushed(function() {
+      if (isTRUE(recife_only_map) || isTRUE(lock_recife)) return(invisible(NULL))
+      if (!is.null(pe_lookup) && is.data.frame(pe_lookup) && nrow(pe_lookup) > 0) {
+        updateSelectizeInput(
+          session,
+          "municipio_search",
+          choices = stats::setNames(pe_lookup$cod_mun7, pe_lookup$search_label),
+          selected = character(0),
+          server = TRUE
+        )
+      }
+    }, once = TRUE)
+
+    geo_uf <- NULL
+
+    # ----------------------------
+    # Leaflet render 
+    # ----------------------------
+    output$map <- leaflet::renderLeaflet({
+      tryCatch({
+        m <- leaflet::leaflet(options = leafletOptions(
+          zoomControl = TRUE,
+          attributionControl = FALSE,
+          minZoom = 3,
+          maxZoom = 12,
+          worldCopyJump = FALSE,
+          zoomAnimation = FALSE,
+          fadeAnimation = FALSE,
+          markerZoomAnimation = FALSE,
+          preferCanvas = TRUE
+        ))
+
+        m <- m %>% leaflet::addMapPane("recifeShapePane", zIndex = 620)
+        m <- m %>% leaflet::addMapPane("sinanPointsPane", zIndex = 650)
+
+        m <- m %>% addRectangles(
+          lng1 = -180, lat1 = -85, lng2 = 180, lat2 = 85,
+          group = "bg",
+          fillColor = "#FFFFFF", fillOpacity = 1,
+          color = "#FFFFFF", opacity = 0,
+          weight = 0,
+          options = pathOptions(interactive = FALSE)
+        )
+
+        bb0 <- NULL
+        if (isTRUE(recife_only_map) || isTRUE(lock_recife)) {
+          m <- m %>% setView(lng = -34.9000, lat = -8.0500, zoom = 11)
+        } else if (!is.null(geo_uf) && inherits(geo_uf, "sf") && nrow(geo_uf) > 0) {
+          u0 <- .to_uf(get_uf())
+          if (!is.na(u0) && nzchar(u0) && "uf" %in% names(geo_uf)) {
+            g0 <- tryCatch(geo_uf[geo_uf$uf == u0, , drop = FALSE], error = function(e) NULL)
+            if (!is.null(g0) && inherits(g0, "sf") && nrow(g0) > 0) {
+              bb0 <- tryCatch(sf::st_bbox(g0), error = function(e) NULL)
+            }
+          }
+          if (is.null(bb0)) {
+            bb0 <- tryCatch(sf::st_bbox(geo_uf), error = function(e) NULL)
+          }
+        }
+        if (!isTRUE(lock_recife) && !is.null(bb0)) {
+          m <- m %>% fitBounds(lng1 = bb0[["xmin"]], lat1 = bb0[["ymin"]], lng2 = bb0[["xmax"]], lat2 = bb0[["ymax"]])
+        } else if (!isTRUE(lock_recife)) {
+          m <- m %>% setView(lng = -37.5, lat = -8.5, zoom = 7)
+        }
+
+        m <- m %>% htmlwidgets::onRender(sprintf("
+          function(el, x){
+            var map = this;
+            window.__sinanLeafletMaps = window.__sinanLeafletMaps || {};
+            window.__sinanLeafletMaps[el.id] = map;
+
+            var BackCtrl = L.Control.extend({
+              options: { position: 'topleft' },
+              onAdd: function(map){
+                var div = L.DomUtil.create('div', 'leaflet-control sinan-backctrl');
+                div.innerHTML = \"<div class='sinan-backbtn disabled' title='Voltar'>&lt;</div>\";
+                L.DomEvent.disableClickPropagation(div);
+                var btn = div.querySelector('.sinan-backbtn');
+                map._sinanBackBtn = btn;
+                L.DomEvent.on(div, 'click', function(e){
+                  if(btn && btn.classList.contains('disabled')) return;
+                  if(window.Shiny){
+                    Shiny.setInputValue('%s', Date.now(), {priority:'event'});
+                  }
+                });
+                return div;
+              }
+            });
+            map.addControl(new BackCtrl());
+            try{
+              if(window.__sinanMapHover && window.__sinanMapHover.attach){
+                window.__sinanMapHover.attach(map);
+              }
+            }catch(e){}
+          }
+        ", session$ns("map_back_click")))
+
+        m
+      }, error = function(e) {
+        logw("renderLeaflet_error", conditionMessage(e))
+        leaflet() %>% setView(lng = -37.5, lat = -8.5, zoom = 7)
+      })
+    })
+
+    # ----------------------------
+    # Messaging helpers
+    # ----------------------------
+    .send_fit <- function(bb, max_zoom = NULL) {
+      bb4 <- .bbox_num(bb)
+      if (is.null(bb4)) return(invisible(NULL))
+      session$sendCustomMessage(session$ns("map_fit"), list(id = session$ns("map"), bb = bb4, maxZoom = max_zoom))
+      invisible(NULL)
+    }
+    .invalidate <- function() {
+      session$sendCustomMessage(session$ns("map_invalidate"), list(id = session$ns("map")))
+      invisible(NULL)
+    }
+
+    .safe_proxy <- function() tryCatch(leafletProxy("map", session = session), error = function(e) NULL)
+    .clear_groups <- function(proxy, groups = c("polys","sel","bg")) {
+      if (is.null(proxy)) return(invisible(NULL))
+      for (g in groups) try(proxy %>% clearGroup(g), silent = TRUE)
+      invisible(NULL)
+    }
+    .clear_controls <- function(proxy) {
+      if (is.null(proxy)) return(invisible(NULL))
+      try(proxy %>% clearControls(), silent = TRUE)
+      invisible(NULL)
+    }
+    .clear_tiles <- function(proxy) {
+      if (is.null(proxy)) return(invisible(NULL))
+      try(proxy %>% clearTiles(), silent = TRUE)
+      invisible(NULL)
+    }
+
+    # ----------------------------
+    # Metric helpers
+    # ----------------------------
+    .metric_col <- function(mtr) {
+      if (identical(mtr, "incid"))  return("incid_100k_total")
+      if (identical(mtr, "cases"))  return("casos_total")
+      if (identical(mtr, "obitos")) return("casos_obitos")
+      if (identical(mtr, "cura"))   return("casos_cura")
+      if (identical(mtr, "pop"))    return("pop_total")
+      "incid_100k_total"
+    }
+    .metric_digits <- function(mtr) if (identical(mtr, "incid")) 1 else 0
+    .metric_label <- function(mtr) {
+      labs <- .obj_get(pack, "KPI_LABELS", list()) %||% list()
+      base_lbl <- NULL
+      if (mtr %in% names(labs)) base_lbl <- .as_chr1(labs[[mtr]], NULL)
+
+      if (identical(mtr, "incid")) {
+        base_lbl <- base_lbl %||% "Incidência"
+        return(paste0(base_lbl, " (100k)"))
+      }
+      if (identical(mtr, "cases")) return(base_lbl %||% "Casos novos")
+      if (identical(mtr, "obitos")) return(base_lbl %||% "Óbitos")
+      if (identical(mtr, "cura")) return(base_lbl %||% "Curas")
+      if (identical(mtr, "pop")) return(base_lbl %||% "População")
+      "Métrica"
+    }
+
+    .legend_counts_html <- function(vals, bins, mtr, digs = 0L) {
+      v <- suppressWarnings(as.numeric(vals))
+      ok <- is.finite(v)
+      v_ok <- v[ok]
+      if (length(v_ok) == 0) return(NULL)
+
+      cuts <- suppressWarnings(as.numeric(bins))
+      cuts <- cuts[is.finite(cuts)]
+      cuts <- unique(cuts)
+      if (length(cuts) < 2) return(NULL)
+      cuts <- sort(cuts)
+
+      fmt <- function(z) formatC(z, format = "f", digits = digs, big.mark = ".", decimal.mark = ",")
+      fmt_int <- function(z) formatC(z, format = "f", digits = 0, big.mark = ".", decimal.mark = ",")
+
+      rows <- vector("list", length(cuts) - 1L)
+      for (i in seq_len(length(cuts) - 1L)) {
+        lo <- cuts[[i]]
+        hi <- cuts[[i + 1L]]
+        if (i == 1L) {
+          idx <- ok & v >= lo & v <= hi
+        } else {
+          idx <- ok & v > lo & v <= hi
+        }
+        if (identical(mtr, "cases")) {
+          val <- sum(v[idx], na.rm = TRUE)
+          val_str <- fmt_int(val)
+        } else {
+          val <- sum(idx, na.rm = TRUE)
+          val_str <- fmt_int(val)
+        }
+        rows[[i]] <- paste0(
+          "<tr><td>", fmt(lo), " – ", fmt(hi), "</td><td>", val_str, "</td></tr>"
+        )
+      }
+
+      na_n <- sum(!ok)
+      na_row <- if (is.finite(na_n) && na_n > 0) {
+        paste0("<tr class='na'><td>Sem dados</td><td>", fmt_int(na_n), "</td></tr>")
+      } else ""
+
+      title <- if (identical(mtr, "cases")) "Casos por classe" else "Regiões por classe"
+      col_lbl <- if (identical(mtr, "cases")) "Casos" else "N"
+
+      paste0(
+        "<div class='sinan-legend-counts'>",
+        "<div class='sinan-legend-counts-title'>", title, "</div>",
+        "<table>",
+        "<thead><tr><th>Classe</th><th>", col_lbl, "</th></tr></thead>",
+        "<tbody>", paste0(unlist(rows), collapse = ""), na_row, "</tbody>",
+        "</table></div>"
+      )
+    }
+
+    # ----------------------------
+    # Tooltip HTML
+    # ----------------------------
+    .fmt_int <- function(x) {
+      x <- suppressWarnings(as.numeric(x))
+      if (!is.finite(x)) return("NA")
+      formatC(x, format = "f", digits = 0, big.mark = ".", decimal.mark = ",")
+    }
+    .fmt_1 <- function(x) {
+      x <- suppressWarnings(as.numeric(x))
+      if (!is.finite(x)) return("NA")
+      formatC(x, format = "f", digits = 1, big.mark = ".", decimal.mark = ",")
+    }
+
+    .tooltip_html_vec <- function(g2, lvl, mtr) {
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) return(character(0))
+
+      c_new <- .metric_base_color("cases", pack)
+      c_inc <- .metric_base_color("incid", pack)
+      c_obt <- .metric_base_color("obitos", pack)
+      c_cur <- .metric_base_color("cura", pack)
+      c_pop <- .metric_base_color("pop", pack)
+
+      metric_lbl <- .metric_label(mtr)
+      digs <- .metric_digits(mtr)
+
+      if (!"uf" %in% names(g2)) g2$uf <- NA_character_
+      if (identical(lvl, "MUN") && !"nome_mun" %in% names(g2)) g2$nome_mun <- as.character(g2$cod_mun7 %||% "")
+
+      title <- if (identical(lvl, "UF")) {
+        if ("nome_uf" %in% names(g2)) {
+          nmuf <- as.character(g2$nome_uf %||% "")
+          ufsg <- as.character(g2$uf %||% "")
+          ifelse(nzchar(nmuf), nmuf, ufsg)
+        } else {
+          as.character(g2$uf %||% "")
+        }
+      } else if (identical(lvl, "MACRO")) {
+        as.character(g2$nome_macro %||% g2$region_name %||% g2$geo_nome %||% "")
+      } else if (identical(lvl, "MICRO")) {
+        as.character(g2$nome_micro %||% g2$region_name %||% g2$geo_nome %||% "")
+      } else {
+        nm <- as.character(g2$nome_mun %||% g2$geo_nome %||% g2$cod_mun7 %||% "")
+        uf <- as.character(g2$uf %||% "")
+        ifelse(nzchar(uf), paste0(nm, " (", uf, ")"), nm)
+      }
+
+      metric_val <- suppressWarnings(as.numeric(g2$val))
+      metric_str <- ifelse(
+        is.finite(metric_val),
+        if (digs == 1) vapply(metric_val, .fmt_1, character(1)) else vapply(metric_val, .fmt_int, character(1)),
+        "NA"
+      )
+
+      v_new <- suppressWarnings(as.numeric(g2$casos_novos))
+      v_inc <- suppressWarnings(as.numeric(g2$incid_100k_total))
+      v_obt <- suppressWarnings(as.numeric(g2$casos_obitos))
+      v_cur <- suppressWarnings(as.numeric(g2$casos_cura))
+      v_pop <- suppressWarnings(as.numeric(g2$pop_total))
+
+      row1 <- function(dot, k, v, fmtfun) {
+        vv <- ifelse(is.finite(v), vapply(v, fmtfun, character(1)), "NA")
+        paste0(
+          "<div class='sinan-tip-row'>",
+          "<div class='sinan-tip-l'>",
+          "<span class='sinan-tip-dot' style='background:", dot, "'></span>",
+          "<span class='sinan-tip-k'>", htmlEscape(k), "</span>",
+          "</div>",
+          "<div class='sinan-tip-v'>", vv, "</div>",
+          "</div>"
+        )
+      }
+
+      paste0(
+        "<div class='sinan-tip-scroll'>",
+        "<div class='sinan-tip-hdr'>",
+        "<div class='sinan-tip-title'>", htmlEscape(title), "</div>",
+        "<div class='sinan-tip-sub'>", htmlEscape(metric_lbl), ": ", metric_str, "</div>",
+        "</div>",
+        row1(c_new, "Casos novos", v_new, .fmt_int),
+        "<div class='sinan-tip-sp'></div>",
+        row1(c_inc, "Taxa de detecção/100k", v_inc, .fmt_1),
+        row1(c_obt, "Óbitos", v_obt, .fmt_int),
+        row1(c_cur, "Curas", v_cur, .fmt_int),
+        row1(c_pop, "População", v_pop, .fmt_int),
+        "</div>"
+      )
+    }
+
+    tb_points_all <- NULL
+    recife_bairros_current <- NULL
+    .get_tb_recife_points <- function(y = NULL) {
+      if (!isTRUE(lock_recife) || !isTRUE(is_tb_map)) return(NULL)
+      if (is.null(tb_points_all)) tb_points_all <<- .read_tb_recife_points(cfg)
+      .prep_tb_recife_points(tb_points_all, year = y)
+    }
+
+    .draw_tb_recife_points <- function(proxy, y) {
+      if (!is.null(proxy)) try(proxy %>% leaflet::clearGroup("tb_points"), silent = TRUE)
+      invisible(NULL)
+    }
+
+    .draw_recife_shapes <- function(proxy, year = NULL, mtr = NULL, do_fit = FALSE) {
+      if (is.null(proxy) || !isTRUE(lock_recife)) return(invisible(NULL))
+
+      layers <- tryCatch(.read_recife_shape_layers(cfg), error = function(e) {
+        logw("recife_shape_read_error", conditionMessage(e))
+        list(bairros = NULL, distritos = NULL)
+      })
+
+      try(proxy %>% leaflet::clearGroup("recife_bairros"), silent = TRUE)
+      try(proxy %>% leaflet::clearGroup("recife_distritos"), silent = TRUE)
+      try(proxy %>% leaflet::clearGroup("recife_selection"), silent = TRUE)
+      recife_bairros_current <<- NULL
+
+      bairros <- layers$bairros
+      if (!is.null(bairros) && inherits(bairros, "sf") && nrow(bairros) > 0) {
+        bairros$shape_key <- .recife_bairro_key(bairros$shape_name)
+        bairros$shape_layer_id <- paste0("recife_bairro_", bairros$shape_id)
+
+        choropleth_on <- FALSE
+        if (isTRUE(is_tb_map)) {
+          counts <- tryCatch(
+            .prep_tb_recife_bairro_counts(.read_tb_recife_cases(cfg), year = year),
+            error = function(e) {
+              logw("recife_tb_bairro_counts_error", conditionMessage(e))
+              NULL
+            }
+          )
+          if (!is.null(counts) && is.data.frame(counts) && nrow(counts) > 0) {
+            bairros <- tryCatch(
+              dplyr::left_join(bairros, counts, by = c("shape_key" = "localidade_key")),
+              error = function(e) bairros
+            )
+            choropleth_on <- "casos_tb" %in% names(bairros)
+          }
+        }
+
+        if (!"casos_tb" %in% names(bairros)) bairros$casos_tb <- NA_real_
+        bairros$casos_tb <- suppressWarnings(as.numeric(bairros$casos_tb))
+        bairros$casos_tb[!is.finite(bairros$casos_tb)] <- 0
+
+        if (!"pop" %in% names(bairros)) bairros$pop <- NA_real_
+        bairros$pop <- suppressWarnings(as.numeric(bairros$pop))
+        if (!"incid_100k" %in% names(bairros)) bairros$incid_100k <- NA_real_
+        bairros$incid_100k <- suppressWarnings(as.numeric(bairros$incid_100k))
+
+        show_incid <- isTRUE(choropleth_on) && identical(as.character(mtr %||% "cases"), "incid") &&
+          any(is.finite(bairros$incid_100k))
+
+        vals <- if (isTRUE(show_incid)) suppressWarnings(as.numeric(bairros$incid_100k)) else suppressWarnings(as.numeric(bairros$casos_tb))
+        max_val <- suppressWarnings(max(vals, na.rm = TRUE))
+        if (!is.finite(max_val)) max_val <- 0
+        map_cols <- .res(.obj_get(pack, "COLORS", NULL)) %||% list()
+        map_bg <- .obj_get(map_cols, "background", NULL) %||% "#F4F4F4"
+        map_border <- .obj_get(map_cols, "border", NULL) %||% "#DEE2E6"
+        map_highlight <- .obj_get(map_cols, "secondary", NULL) %||% "#1E73BE"
+        map_palette <- .metric_palette_colors(if (isTRUE(show_incid)) "incid" else "cases", pack)
+
+        quartiles <- .map_quartile_legend(vals, map_palette, map_bg, positive_only = TRUE)
+        pal <- quartiles$pal
+
+        fill_op <- if (isTRUE(choropleth_on)) 0.82 else 0.34
+        bairros$shape_fill <- if (isTRUE(choropleth_on)) pal(vals) else map_bg
+        bairros$shape_label <- if (isTRUE(choropleth_on)) {
+          yy <- suppressWarnings(as.integer(year))
+          yy <- if (length(yy) > 0 && is.finite(yy[[1]])) paste0(" em ", yy[[1]]) else ""
+          if (isTRUE(show_incid)) {
+            incid_txt <- ifelse(
+              is.finite(bairros$incid_100k),
+              formatC(bairros$incid_100k, format = "f", digits = 1, big.mark = ".", decimal.mark = ","),
+              "sem pop."
+            )
+            paste0(
+              bairros$shape_name, ": ", incid_txt, " / 100 mil hab. (",
+              vapply(bairros$casos_tb, .fmt_int, character(1)), " casos)", yy
+            )
+          } else {
+            paste0(bairros$shape_name, ": ", vapply(bairros$casos_tb, .fmt_int, character(1)), " casos", yy)
+          }
+        } else {
+          bairros$shape_name
+        }
+
+        tryCatch({
+          proxy %>% leaflet::addPolygons(
+            data = bairros,
+            group = "recife_bairros",
+            weight = 0.95,
+            opacity = 0.95,
+            color = map_border,
+            fill = TRUE,
+            fillColor = ~shape_fill,
+            fillOpacity = fill_op,
+            layerId = ~shape_layer_id,
+            label = ~shape_label,
+            labelOptions = leaflet::labelOptions(
+              direction = "auto",
+              textsize = "12px",
+              opacity = 0.92,
+              sticky = TRUE
+            ),
+            highlightOptions = leaflet::highlightOptions(
+              weight = 1.5,
+              color = map_highlight,
+              fillOpacity = min(0.95, fill_op + 0.12),
+              bringToFront = FALSE
+            ),
+            options = leaflet::pathOptions(
+              smoothFactor = 0.45,
+              interactive = TRUE,
+              pane = "recifeShapePane"
+            )
+          )
+        }, error = function(e) {
+          logw("recife_bairros_draw_error", conditionMessage(e))
+        })
+
+        if (isTRUE(choropleth_on)) {
+          tryCatch({
+            proxy %>% leaflet::addLegend(
+              position = "topright",
+              colors = quartiles$colors,
+              labels = quartiles$labels,
+              title = paste0(
+                "<div class='sinan-quartile-title'>",
+                if (isTRUE(show_incid)) "Incidência (/100 mil hab.)" else "Casos",
+                "</div><div class='sinan-quartile-subtitle'>Quartis &mdash; ",
+                htmltools::htmlEscape(as.character(year)), " &middot; valores positivos</div>"
+              ),
+              opacity = 0.9,
+              layerId = "recife_bairros_legend"
+            )
+          }, error = function(e) {
+            logw("recife_bairros_legend_error", conditionMessage(e))
+          })
+        }
+
+        recife_bairros_current <<- bairros
+        selected_key <- .obj_get(nav, "selected_bairro_key", NULL) %||%
+          .obj_get(state, "selected_bairro_key", NULL)
+        .draw_recife_selection(proxy, selected_key)
+      }
+
+      if (isTRUE(do_fit)) {
+        gfit <- bairros
+        if (!is.null(gfit) && inherits(gfit, "sf") && nrow(gfit) > 0) {
+          bb <- tryCatch(sf::st_bbox(gfit), error = function(e) NULL)
+          if (!is.null(bb)) .send_fit(bb, max_zoom = 12)
+        }
+      }
+
+      invisible(NULL)
+    }
+
+    .draw_recife_selection <- function(proxy = NULL, bairro_key = NULL) {
+      proxy <- proxy %||% .safe_proxy()
+      if (is.null(proxy)) return(invisible(NULL))
+      try(proxy %>% leaflet::clearGroup("recife_selection"), silent = TRUE)
+
+      key <- as.character(bairro_key %||% "")
+      if (length(key) == 0 || !nzchar(key[[1]]) || is.null(recife_bairros_current)) {
+        return(invisible(NULL))
+      }
+
+      g <- recife_bairros_current[
+        !is.na(recife_bairros_current$shape_key) &
+          recife_bairros_current$shape_key == key[[1]],
+        , drop = FALSE
+      ]
+      if (!inherits(g, "sf") || nrow(g) == 0) return(invisible(NULL))
+
+      cols <- .res(.obj_get(pack, "COLORS", NULL)) %||% list()
+      selection_color <- .obj_get(cols, "accent", NULL) %||% "#4A8EFF"
+      try(
+        proxy %>% leaflet::addPolygons(
+          data = g,
+          group = "recife_selection",
+          weight = 4,
+          opacity = 1,
+          color = selection_color,
+          fill = FALSE,
+          layerId = paste0("recife_selection_", g$shape_id),
+          options = leaflet::pathOptions(
+            interactive = FALSE,
+            pane = "sinanPointsPane"
+          )
+        ),
+        silent = TRUE
+      )
+      invisible(NULL)
+    }
+
+    # ------------------------------------------------------------------
+    # Parquet
+    # ------------------------------------------------------------------
+    parquet_root_cache <- reactiveVal(NULL)
+
+    .find_incidence_root <- function() {
+      dash <- .find_dashboard_dir(cfg)
+      cands <- c(
+        file.path(dash, "incidence"),
+        file.path(dash, "incidencia"),
+        file.path(dirname(dash), "canonical", "incidence"),
+        file.path(dirname(dash), "canonical", "incidencia")
+      )
+      cands <- unique(normalizePath(cands, winslash = "/", mustWork = FALSE))
+      for (p in cands) if (nzchar(p) && dir.exists(p)) return(p)
+      NULL
+    }
+
+    .get_parquet_root <- function() {
+      rr <- parquet_root_cache()
+      if (!is.null(rr) && nzchar(rr) && dir.exists(rr)) return(rr)
+      rr <- .find_incidence_root()
+      parquet_root_cache(rr)
+      rr
+    }
+
+    .partition_dir_candidates <- function(root, level, year, uf = NULL) {
+      lvl <- toupper(as.character(level))
+      y <- as.integer(year)
+      u <- if (!is.null(uf)) .to_uf(uf) else NA_character_
+
+      out <- character(0)
+
+      if (lvl == "UF") {
+        out <- c(
+          file.path(root, "nivel=UF", paste0("ano=", y)),
+          file.path(root, "nivel=uf", paste0("ano=", y)),
+          file.path(root, paste0("ano=", y), "nivel=UF"),
+          file.path(root, paste0("ano=", y), "nivel=uf")
+        )
+      } else if (lvl == "MUN") {
+        if (!is.na(u) && nzchar(u)) {
+          out <- c(
+            file.path(root, "nivel=MUN", paste0("uf=", u), paste0("ano=", y)),
+            file.path(root, "nivel=mun", paste0("uf=", u), paste0("ano=", y)),
+            file.path(root, "nivel=MUN", paste0("ano=", y), paste0("uf=", u)),
+            file.path(root, "nivel=mun", paste0("ano=", y), paste0("uf=", u))
+          )
+        } else {
+          out <- c(
+            file.path(root, "nivel=MUN", paste0("ano=", y)),
+            file.path(root, "nivel=mun", paste0("ano=", y)),
+            file.path(root, paste0("ano=", y), "nivel=MUN"),
+            file.path(root, paste0("ano=", y), "nivel=mun")
+          )
+        }
+      }
+
+      unique(normalizePath(out, winslash = "/", mustWork = FALSE))
+    }
+
+    .parquet_files_from_dir <- function(dirpath) {
+      if (is.null(dirpath) || !nzchar(dirpath) || !dir.exists(dirpath)) return(character(0))
+      f <- list.files(dirpath, pattern = "\\.parquet$", full.names = TRUE)
+      f[file.exists(f)]
+    }
+
+    .read_parquet_fast <- function(files, col_select = NULL) {
+      if (length(files) == 0) return(NULL)
+      tryCatch({
+        arrow::read_parquet(files, as_data_frame = TRUE, col_select = col_select)
+      }, error = function(e) NULL)
+    }
+
+    ds_cache <- reactiveVal(NULL)
+    .get_ds <- function() {
+      ds <- ds_cache()
+      if (!is.null(ds)) return(ds)
+      root <- .get_parquet_root()
+      if (is.null(root) || !dir.exists(root)) return(NULL)
+      ds <- tryCatch(arrow::open_dataset(root, partitioning = "hive"), error = function(e) NULL)
+      ds_cache(ds)
+      ds
+    }
+    .ds_collect_safe <- function(tbl) {
+      tryCatch(dplyr::collect(tbl), error = function(e) {
+        logw("arrow_collect_error", e$message)
+        NULL
+      })
+    }
+
+    metrics_cache <- new.env(parent = emptyenv())
+
+    .get_metrics_fast <- function(level, year, uf = NULL) {
+      root <- .get_parquet_root()
+      if (is.null(root) || !dir.exists(root)) return(NULL)
+
+      lvl <- toupper(as.character(level))
+      y <- as.integer(year)
+      u <- if (!is.null(uf)) .to_uf(uf) else NA_character_
+
+      cache_key <- if (lvl == "UF") paste0("UF|", y) else paste0("MUN|", y, "|", u %||% "")
+      if (exists(cache_key, envir = metrics_cache, inherits = FALSE)) return(get(cache_key, envir = metrics_cache, inherits = FALSE))
+
+      col_select <- c(
+        "uf","sigla_uf","sg_uf",
+        "cod_mun7","geo_id","CD_MUN","cd_mun","id",
+        "nome_mun","geo_nome","municipio","nome",
+        "casos_total","cases_total","casos",
+        "casos_novos","cases_new","new_cases",
+        "casos_obitos","obitos_total","obitos",
+        "casos_cura","cura_total","curas_total","curas",
+        "pop_total","pop",
+        "incid_100k_total","incid_100k","incidencia_100k_total","incid"
+      )
+
+      dirs <- .partition_dir_candidates(root, lvl, y, uf = if (lvl == "MUN") u else NULL)
+      df <- NULL
+      used_dir <- NULL
+      used_nfiles <- 0L
+
+      for (d in dirs) {
+        f <- .parquet_files_from_dir(d)
+        if (length(f) > 0) {
+          used_dir <- d
+          used_nfiles <- length(f)
+          df <- .read_parquet_fast(f, col_select = col_select)
+          if (!is.null(df) && is.data.frame(df) && nrow(df) > 0) break
+        }
+      }
+
+      if (is.null(df) || !is.data.frame(df)) {
+        ds <- .get_ds()
+        if (!is.null(ds)) {
+          if (lvl == "UF") {
+            df <- .ds_collect_safe(ds %>%
+              dplyr::filter(.data$ano == y, toupper(as.character(.data$nivel)) == "UF") %>%
+              dplyr::select(any_of(col_select))
+            )
+          } else {
+            if (!is.na(u) && nzchar(u)) {
+              df <- .ds_collect_safe(ds %>%
+                dplyr::filter(.data$ano == y, toupper(as.character(.data$nivel)) == "MUN") %>%
+                dplyr::filter(.data$uf == u | .data$sg_uf == u) %>%
+                dplyr::select(any_of(col_select))
+              )
+            } else {
+              df <- .ds_collect_safe(ds %>%
+                dplyr::filter(.data$ano == y, toupper(as.character(.data$nivel)) == "MUN") %>%
+                dplyr::select(any_of(col_select))
+              )
+            }
+          }
+        }
+      }
+
+      if (.debug_enabled()) {
+        .log_debug("PARQUET root:", root)
+        .log_debug("FAST-PATH lvl=", lvl, " ano=", y, " uf=", u %||% "")
+        .log_debug("FAST-PATH used_dir:", used_dir %||% "(dataset fallback)")
+        .log_debug("FAST-PATH nfiles:", used_nfiles)
+        .log_debug("FAST-PATH rows:", if (is.data.frame(df)) nrow(df) else NA)
+      }
+
+      assign(cache_key, df, envir = metrics_cache)
+      df
+    }
+
+    .get_uf_metrics <- function(y) {
+      df <- .safe_get("get_uf_metrics", ano = y, year = y, y = y)
+      if (is.null(df)) df <- .get_metrics_fast("UF", y, uf = NULL)
+      .std_uf_metrics(df)
+    }
+
+    .get_mun_metrics <- function(y, uf) {
+      u <- .to_uf(uf)
+      if (is.na(u) || !nzchar(u)) return(NULL)
+      df <- .safe_get("get_mun_metrics", ano = y, year = y, uf = u, sg_uf = u)
+      if (is.null(df)) df <- .get_metrics_fast("MUN", y, uf = u)
+      out <- .std_mun_metrics(df)
+      if (!is.null(out) && any(!is.na(out$uf))) out <- out[out$uf == u | is.na(out$uf), , drop = FALSE]
+      out
+    }
+
+    # ----------------------------
+    # Join builders + cache
+    # ----------------------------
+    .get_joined_uf <- function(y, mtr) {
+      k <- paste0("UF|", y, "|", mtr)
+      if (exists(k, envir = join_cache, inherits = FALSE)) return(get(k, envir = join_cache, inherits = FALSE))
+
+      g <- geo_uf
+      if (is.null(g) || !inherits(g, "sf") || nrow(g) == 0) { assign(k, NULL, envir = join_cache); return(NULL) }
+
+      df <- .get_uf_metrics(y)
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+        df <- data.frame(
+          uf = character(0),
+          casos_total = numeric(0),
+          casos_novos = numeric(0),
+          casos_obitos = numeric(0),
+          casos_cura = numeric(0),
+          pop_total = numeric(0),
+          incid_100k_total = numeric(0),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      g2 <- tryCatch(dplyr::left_join(g, df, by = "uf"), error = function(e) g)
+      g2 <- .sf_fix_for_leaflet(g2)
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) { assign(k, NULL, envir = join_cache); return(NULL) }
+
+      for (cn in c("casos_total","casos_novos","casos_obitos","casos_cura","pop_total","incid_100k_total")) {
+        if (!cn %in% names(g2)) g2[[cn]] <- NA_real_
+        g2[[cn]] <- suppressWarnings(as.numeric(g2[[cn]]))
+      }
+
+      mc <- .metric_col(mtr)
+      if (!mc %in% names(g2)) g2[[mc]] <- NA_real_
+      g2[[mc]] <- suppressWarnings(as.numeric(g2[[mc]]))
+
+      g2$val <- g2[[mc]]
+      g2$id  <- as.character(g2$uf)
+
+      g2$tip_html <- as.character(.tooltip_html_vec(g2, lvl = "UF", mtr = mtr))
+
+      assign(k, g2, envir = join_cache)
+      g2
+    }
+
+    .get_joined_mun <- function(y, uf, mtr) {
+      u <- .to_uf(uf)
+      if (is.na(u) || !nzchar(u)) return(NULL)
+
+      k <- paste0("MUN|", y, "|", u, "|", mtr)
+      if (exists(k, envir = join_cache, inherits = FALSE)) return(get(k, envir = join_cache, inherits = FALSE))
+
+      gg <- .get_geo_mun_for_uf(u)
+      if (is.null(gg) || !inherits(gg, "sf") || nrow(gg) == 0) { assign(k, NULL, envir = join_cache); return(NULL) }
+
+      if (!"cod_mun7" %in% names(gg)) {
+        alt <- intersect(c("geo_id","GEO_ID","CD_MUN","COD_MUN7","id"), names(gg))
+        gg$cod_mun7 <- if (length(alt) > 0) .to_mun7(gg[[alt[[1]]]]) else NA_character_
+      }
+      if (!"uf" %in% names(gg)) gg$uf <- u
+      gg$uf <- .to_uf(gg$uf)
+      gg$cod_mun7 <- .to_mun7(gg$cod_mun7)
+      if (!"nome_mun" %in% names(gg)) gg$nome_mun <- as.character(gg$cod_mun7)
+
+      df <- .get_mun_metrics(y, u)
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) {
+        df <- data.frame(
+          cod_mun7 = character(0),
+          casos_total = numeric(0),
+          casos_novos = numeric(0),
+          casos_obitos = numeric(0),
+          casos_cura = numeric(0),
+          pop_total = numeric(0),
+          incid_100k_total = numeric(0),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      df$cod_mun7 <- .to_mun7(df$cod_mun7)
+      for (cn in c("casos_total","casos_novos","casos_obitos","casos_cura","pop_total","incid_100k_total")) {
+        if (!cn %in% names(df)) df[[cn]] <- NA_real_
+        df[[cn]] <- suppressWarnings(as.numeric(df[[cn]]))
+      }
+
+      keep <- c("cod_mun7","casos_total","casos_novos","casos_obitos","casos_cura","pop_total","incid_100k_total")
+      df2  <- df[, intersect(keep, names(df)), drop = FALSE]
+
+      g2 <- tryCatch(dplyr::left_join(gg, df2, by = "cod_mun7"), error = function(e) gg)
+          
+      g2 <- .sf_fix_for_leaflet(g2)
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) { assign(k, NULL, envir = join_cache); return(NULL) }
+
+      for (cn in c("casos_total","casos_novos","casos_obitos","casos_cura","pop_total","incid_100k_total")) {
+        if (!cn %in% names(g2)) g2[[cn]] <- NA_real_
+        g2[[cn]] <- suppressWarnings(as.numeric(g2[[cn]]))
+      }
+
+      mc <- .metric_col(mtr)
+      if (!mc %in% names(g2)) g2[[mc]] <- NA_real_
+      g2[[mc]] <- suppressWarnings(as.numeric(g2[[mc]]))
+
+      g2$val <- g2[[mc]]
+      g2$id  <- as.character(g2$cod_mun7)
+
+      g2$tip_html <- as.character(.tooltip_html_vec(g2, lvl = "MUN", mtr = mtr))
+
+      assign(k, g2, envir = join_cache)
+      g2
+    }
+
+    .get_joined_health_region <- function(y, mtr, level = c("MACRO", "MICRO")) {
+      lvl <- match.arg(level)
+      k <- paste0(lvl, "|", y, "|", mtr)
+      if (exists(k, envir = join_cache, inherits = FALSE)) return(get(k, envir = join_cache, inherits = FALSE))
+
+      reg_sf <- if (identical(lvl, "MACRO")) pe_macro_sf else pe_micro_sf
+      if (is.null(reg_sf) || !inherits(reg_sf, "sf") || nrow(reg_sf) == 0) {
+        assign(k, NULL, envir = join_cache)
+        return(NULL)
+      }
+
+      df_mun <- .get_mun_metrics(y, "PE")
+      agg <- .aggregate_region_metrics(df_mun, pe_lookup, level = lvl)
+      if (is.null(agg) || !is.data.frame(agg) || nrow(agg) == 0) {
+        agg <- data.frame(
+          region_key = character(0),
+          region_name = character(0),
+          casos_total = numeric(0),
+          casos_novos = numeric(0),
+          casos_obitos = numeric(0),
+          casos_cura = numeric(0),
+          pop_total = numeric(0),
+          incid_100k_total = numeric(0),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      g2 <- tryCatch(dplyr::left_join(reg_sf, agg, by = "region_key"), error = function(e) reg_sf)
+      g2 <- .sf_fix_for_leaflet(g2)
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) {
+        assign(k, NULL, envir = join_cache)
+        return(NULL)
+      }
+
+      if (identical(lvl, "MACRO") && !"nome_macro" %in% names(g2)) g2$nome_macro <- g2$region_name
+      if (identical(lvl, "MICRO") && !"nome_micro" %in% names(g2)) g2$nome_micro <- g2$region_name
+
+      for (cn in c("casos_total","casos_novos","casos_obitos","casos_cura","pop_total","incid_100k_total")) {
+        if (!cn %in% names(g2)) g2[[cn]] <- NA_real_
+        g2[[cn]] <- suppressWarnings(as.numeric(g2[[cn]]))
+      }
+
+      mc <- .metric_col(mtr)
+      if (!mc %in% names(g2)) g2[[mc]] <- NA_real_
+      g2[[mc]] <- suppressWarnings(as.numeric(g2[[mc]]))
+
+      g2$val <- g2[[mc]]
+      g2$id <- as.character(g2$region_key %||% g2$region_name)
+      g2$tip_html <- as.character(.tooltip_html_vec(g2, lvl = lvl, mtr = mtr))
+
+      assign(k, g2, envir = join_cache)
+      g2
+    }
+
+    .add_polys <- function(proxy, g2, mtr, weight = 1, smooth = 0.65) {
+      if (is.null(proxy) || is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) {
+        .log_debug("add_polys: g2 vazio/nulo")
+        .map_set_diag(proxy, c("add_polys: g2 vazio/nulo"))
+        return(invisible(NULL))
+      }
+
+      try(proxy %>% leaflet::removeControl("sinan_legend_counts"), silent = TRUE)
+
+      rng <- suppressWarnings(range(as.numeric(g2$val), na.rm = TRUE))
+      if (!all(is.finite(rng))) rng <- c(NA_real_, NA_real_)
+
+      pal_cols <- .metric_palette_colors(mtr, pack)
+      map_cols <- .res(.obj_get(pack, "COLORS", NULL)) %||% list()
+      map_na <- .obj_get(map_cols, "background", NULL) %||% "#F3F4F6"
+      map_outline <- .obj_get(map_cols, "institutional", NULL) %||% "#1f1f1f"
+      map_highlight <- .obj_get(map_cols, "secondary", NULL) %||% map_outline
+      pi <- .safe_palette_quantile(g2$val, k = 6L, palette = pal_cols, na.color = map_na)
+
+      if (!is.null(pi$err)) {
+        .map_set_diag(proxy, c(
+          paste0("lvl=", toupper(get_level()), "  ano=", .obj_get(state, "ano", NA), "  mtr=", mtr),
+          paste0("rows=", nrow(g2), "  val_range=[", rng[1], ", ", rng[2], "]"),
+          paste0("palette_error=", pi$err)
+        ))
+      } else {
+        .map_set_diag(proxy, c(
+          paste0("lvl=", toupper(get_level()), "  ano=", .obj_get(state, "ano", NA), "  mtr=", mtr),
+          paste0("rows=", nrow(g2), "  val_range=[", rng[1], ", ", rng[2], "]"),
+          "palette=OK"
+        ))
+      }
+
+      quartiles <- .map_quartile_legend(g2$val, pal_cols, map_na)
+      pal <- quartiles$pal
+
+      ok_poly <- tryCatch({
+        pps <- lapply(as.character(g2$tip_html %||% ""), htmltools::HTML)
+
+        proxy %>% addPolygons(
+          data = g2,
+          group = "polys",
+          weight = weight,
+          opacity = 1,
+          color = map_outline,
+          fill = TRUE,
+          fillColor = pal(g2$val),
+          fillOpacity = 0.86,
+          layerId = g2$id,
+          highlightOptions = highlightOptions(
+            weight = max(2, weight + 1), color = map_highlight,
+            fillOpacity = 0.93, bringToFront = TRUE
+          ),
+          options = pathOptions(smoothFactor = smooth, interactive = TRUE, bubblingMouseEvents = TRUE),
+          popup = pps,
+          popupOptions = popupOptions(closeButton = FALSE, autoClose = TRUE, closeOnClick = FALSE, className = "sinan-hidden-popup")
+        )
+        TRUE
+      }, error = function(e) {
+        msg <- conditionMessage(e)
+        .log_debug("addPolygons ERROR:", msg)
+        .map_set_diag(proxy, c(
+          paste0("DRAW ERROR: ", msg),
+          paste0("rows=", nrow(g2), "  mtr=", mtr),
+          paste0("val_range=[", rng[1], ", ", rng[2], "]")
+        ))
+        FALSE
+      })
+
+      #  Legenda: somente o LF de cada separatriz     
+      if (isTRUE(ok_poly) && isTRUE(pi$legend) && !is.null(pi$bins) && length(pi$bins) >= 2) {
+        digs <- .metric_digits(mtr)
+
+        lab_fun <- function(type, cuts, p) {
+          cuts <- suppressWarnings(as.numeric(cuts))
+          cuts <- cuts[is.finite(cuts)]
+          if (length(cuts) < 2) return(character(0))
+          fmt <- function(z) formatC(z, format = "f", digits = digs, big.mark = ".", decimal.mark = ",")
+          fmt(cuts[-length(cuts)])
+        }
+
+        tryCatch({
+          proxy %>% addLegend(
+            position  = "topright",
+            colors    = quartiles$colors,
+            labels    = quartiles$labels,
+            title     = "Quartis",
+            opacity   = 0.95,
+            na.label = "Sem dados"
+          )
+        }, error = function(e) {
+          .log_debug("addLegend ERROR:", conditionMessage(e))
+          .map_set_diag(proxy, c("Legend ERROR:", conditionMessage(e)), position = "bottomleft")
+        })
+
+        tryCatch({
+          html_tbl <- .legend_counts_html(g2$val, pi$bins, mtr, digs = digs)
+          if (!is.null(html_tbl)) {
+            proxy %>% leaflet::addControl(
+              html = htmltools::HTML(html_tbl),
+              position = "bottomright",
+              layerId = "sinan_legend_counts"
+            )
+          }
+        }, error = function(e) {
+          .log_debug("legend counts ERROR:", conditionMessage(e))
+        })
+      }
+
+      invisible(NULL)
+    }
+
+    .draw_selection <- function(proxy, g2, select_id, max_zoom = 11) {
+      if (is.null(proxy) || is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) return(invisible(NULL))
+      sid <- as.character(select_id %||% "")
+      if (!nzchar(sid)) return(invisible(NULL))
+
+      idx <- which(as.character(g2$id) == sid)
+      if (length(idx) == 0) return(invisible(NULL))
+      one <- g2[idx[1], , drop = FALSE]
+
+      try(proxy %>% clearGroup("sel"), silent = TRUE)
+
+      try(proxy %>% addPolygons(
+        data = one,
+        group = "sel",
+        weight = 3,
+        opacity = 1,
+        color = "#111111",
+        fill = FALSE,
+        layerId = paste0("sel_", sid),
+        options = pathOptions(interactive = FALSE)
+      ), silent = TRUE)
+
+      try({
+        bb <- sf::st_bbox(one)
+        cen <- sf::st_centroid(sf::st_geometry(one))
+        cen <- sf::st_coordinates(cen)[1, ]
+        proxy %>% addCircleMarkers(
+          lng = cen[1], lat = cen[2],
+          group = "sel",
+          radius = 6, weight = 2,
+          color = "#111111",
+          fill = TRUE, fillOpacity = 0.9,
+          opacity = 1,
+          options = pathOptions(interactive = FALSE)
+        )
+        .send_fit(bb, max_zoom = max_zoom)
+      }, silent = TRUE)
+
+      invisible(NULL)
+    }
+
+    .draw_br <- function(proxy, y, mtr, do_fit = TRUE) {
+      g2 <- .get_joined_uf(y, mtr)
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) return(invisible(NULL))
+
+      .add_polys(proxy, g2, mtr, weight = 1, smooth = 0.6)
+
+      if (isTRUE(do_fit)) {
+        bb <- tryCatch(sf::st_bbox(g2), error = function(e) NULL)
+        if (!is.null(bb)) .send_fit(bb)
+      }
+      invisible(NULL)
+    }
+
+    .draw_health_region_polys <- function(proxy, y, region_view, mtr, do_fit = TRUE, selected_macro = NULL) {
+      rv <- toupper(as.character(region_view %||% "MUN"))
+      if (!rv %in% c("MICRO", "MACRO")) return(FALSE)
+
+      g2 <- .get_joined_health_region(y, mtr, level = rv)
+      if (is.null(g2) || !inherits(g2, "sf") || nrow(g2) == 0) return(FALSE)
+
+      # Filter MICRO regions to those belonging to the selected macro
+      if (identical(rv, "MICRO") && !is.null(selected_macro) && nzchar(selected_macro) && !is.null(pe_lookup)) {
+        micros_in_macro <- unique(pe_lookup$micro_key[pe_lookup$macro_key == selected_macro])
+        if (length(micros_in_macro) > 0) {
+          g2 <- g2[g2$region_key %in% micros_in_macro, , drop = FALSE]
+          if (nrow(g2) == 0) return(FALSE)
+        }
+      }
+
+      .add_polys(proxy, g2, mtr, weight = 1.1, smooth = 0.5)
+
+      if (isTRUE(do_fit)) {
+        bb <- tryCatch(sf::st_bbox(g2), error = function(e) NULL)
+        if (!is.null(bb)) .send_fit(bb, max_zoom = 9)
+      }
+      TRUE
+    }
+
+    .draw_uf_polys <- function(proxy, y, uf, mtr, do_fit = TRUE, region_view = "MUN", selected_macro = NULL, selected_micro = NULL) {
+      u <- .to_uf(uf)
+      if (is.na(u) || !nzchar(u)) return(invisible(NULL))
+
+      rv <- toupper(as.character(region_view %||% "MUN"))
+      if (identical(u, "PE") && rv %in% c("MICRO", "MACRO")) {
+        ok_reg <- .draw_health_region_polys(proxy, y, rv, mtr, do_fit = do_fit, selected_macro = selected_macro)
+        if (isTRUE(ok_reg)) return(invisible(NULL))
+      }
+
+      gmun <- .get_joined_mun(y, u, mtr)
+      if (is.null(gmun) || !inherits(gmun, "sf") || nrow(gmun) == 0) {
+        if (isTRUE(do_fit) && !is.null(geo_uf) && inherits(geo_uf, "sf")) {
+          bb <- tryCatch(sf::st_bbox(geo_uf[geo_uf$uf == u, , drop = FALSE]), error = function(e) NULL)
+          if (!is.null(bb)) .send_fit(bb, max_zoom = 7)
+        }
+        return(invisible(NULL))
+      }
+
+      if (isTRUE(lock_recife) && identical(u, lock_uf) && !is.na(lock_mun7) && nzchar(lock_mun7)) {
+        gmun <- gmun[gmun$cod_mun7 == lock_mun7, , drop = FALSE]
+        if (nrow(gmun) == 0) return(invisible(NULL))
+      }
+
+      # Filter municipalities by selected micro region
+      if (identical(u, "PE") && !is.null(selected_micro) && nzchar(selected_micro) && !is.null(pe_lookup)) {
+        mun_codes <- pe_lookup$cod_mun7[pe_lookup$micro_key == selected_micro]
+        if (length(mun_codes) > 0) {
+          gmun <- gmun[gmun$cod_mun7 %in% mun_codes, , drop = FALSE]
+          if (nrow(gmun) == 0) return(invisible(NULL))
+        }
+      }
+
+      .add_polys(proxy, gmun, mtr, weight = 0.65, smooth = 0.7)
+
+      if (isTRUE(do_fit)) {
+        bb <- tryCatch(sf::st_bbox(gmun), error = function(e) NULL)
+        if (!is.null(bb)) .send_fit(bb, max_zoom = 8)
+      }
+      invisible(NULL)
+    }
+
+    last_key       <- reactiveVal("")
+    last_poly_key  <- reactiveVal("")
+    last_select_id <- reactiveVal("")
+    last_tb_key    <- reactiveVal("")
+
+    redraw <- function(y, lvl, uf, mun, mtr, region_view = "MUN", selected_macro = NULL, selected_micro = NULL) {
+      proxy <- .safe_proxy()
+      if (is.null(proxy) || !is.finite(y)) return(invisible(NULL))
+      if (isTRUE(recife_only_map) || isTRUE(lock_recife)) {
+        lvl <- "MUN"
+        uf <- lock_uf
+        mun <- lock_mun7
+        region_view <- "MUN"
+        selected_macro <- NULL
+        selected_micro <- NULL
+      }
+      draw_view <- if (identical(lvl, "MUN")) "MUN" else toupper(as.character(region_view %||% "MUN"))
+
+      has_drill <- !is.null(selected_macro) || !is.null(selected_micro) || draw_view %in% c("MICRO", "MACRO")
+      is_pe_root <- identical(lvl, "UF") && identical(.to_uf(uf), "PE") && !isTRUE(has_drill)
+      back_enabled <- if (isTRUE(recife_only_map) || isTRUE(lock_recife)) {
+        !is.null(get_selected_bairro_key())
+      } else {
+        !identical(lvl, "BR") && !is_pe_root
+      }
+      .send_back_state(back_enabled)
+
+      base_key <- if (isTRUE(recife_only_map) || isTRUE(lock_recife)) {
+        paste0("BASE|RECIFE|", y, "|", mtr)
+      } else if (lvl == "BR") {
+        paste0("BASE|BR|", y, "|", mtr)
+      } else {
+        paste0("BASE|UF|", y, "|", .to_uf(uf) %||% "", "|", mtr, "|", draw_view,
+               "|ma:", selected_macro %||% "", "|mi:", selected_micro %||% "")
+      }
+
+      if (!identical(base_key, last_poly_key())) {
+        last_poly_key(base_key)
+
+        .clear_tiles(proxy)
+        .clear_groups(proxy, c("polys","sel","tb_points","recife_bairros","recife_distritos","recife_selection"))
+        .clear_controls(proxy)
+
+        tryCatch({
+          if (isTRUE(recife_only_map) || isTRUE(lock_recife)) {
+            .draw_recife_shapes(proxy, year = y, mtr = mtr, do_fit = FALSE)
+          } else if (lvl == "BR") {
+            .draw_br(proxy, y, mtr, do_fit = TRUE)
+          } else {
+            .draw_uf_polys(
+              proxy, y, uf, mtr,
+              do_fit = (lvl == "UF"),
+              region_view = draw_view,
+              selected_macro = selected_macro,
+              selected_micro = selected_micro
+            )
+          }
+        }, error = function(e) {
+          logw("draw_base_error", conditionMessage(e))
+        })
+
+        tb_key <- paste0("TB_POINTS|", if ((isTRUE(recife_only_map) || isTRUE(lock_recife)) && isTRUE(is_tb_map)) "ON" else "OFF")
+        if (!identical(tb_key, last_tb_key())) {
+          last_tb_key(tb_key)
+          .draw_tb_recife_points(proxy, y)
+          later::later(function() {
+            pxy <- .safe_proxy()
+            try(pxy %>% leaflet::clearGroup("tb_points"), silent = TRUE)
+            try(.draw_tb_recife_points(pxy, y), silent = TRUE)
+          }, delay = 0.35)
+        } else {
+          .draw_tb_recife_points(proxy, y)
+        }
+
+        .invalidate()
+
+        later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.03)
+        later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.10)
+        later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.22)
+      }
+
+      if (isTRUE(lock_recife)) {
+        if (!identical("", last_select_id())) last_select_id("")
+        try(proxy %>% clearGroup("sel"), silent = TRUE)
+      } else if (lvl == "MUN") {
+        mun7 <- .to_mun7(mun)
+        if (!is.na(mun7) && nzchar(mun7) && !identical(mun7, last_select_id())) {
+          last_select_id(mun7)
+          u <- .to_uf(uf)
+          gmun <- .get_joined_mun(y, u, mtr)
+          later::later(function() { try(.draw_selection(proxy, gmun, mun7, max_zoom = 11), silent = TRUE) }, delay = 0.05)
+        }
+      } else {
+        if (!identical("", last_select_id())) {
+          last_select_id("")
+          try(proxy %>% clearGroup("sel"), silent = TRUE)
+        }
+      }
+
+      invisible(NULL)
+    }
+
+    session$onFlushed(function() {
+      .obj_set(state, "_map_tick", Sys.time())
+      later::later(function() { try(.invalidate(), silent = TRUE) }, delay = 0.06)
+      later::later(function() { try(.invalidate(), silent = TRUE) }, delay = 0.20)
+      later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.25)
+      later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.45)
+    }, once = TRUE)
+
+    .redraw_req <- reactive({
+      invisible(.obj_get(state, "_map_tick", NULL))
+
+      y <- suppressWarnings(as.integer(.obj_get(state, "ano", NA_integer_)))
+      if (!is.finite(y)) y <- suppressWarnings(as.integer(.obj_get(cfg, "YEAR_MAX", 2025L)))
+
+      lvl <- toupper(as.character(get_level() %||% "UF"))
+      if (!lvl %in% c("BR", "UF", "MUN")) lvl <- "UF"
+
+      uf  <- get_uf()
+      mun <- get_mun()
+
+      mtr <- as.character(.pick_scalar(.obj_get(state, "metric", NULL), "incid"))
+      if (!mtr %in% c("incid", "cases", "obitos", "cura", "pop")) mtr <- "incid"
+
+      region_view <- get_region_view()
+      sel_macro <- get_selected_macro()
+      sel_micro <- get_selected_micro()
+      list(y = y, lvl = lvl, uf = uf, mun = mun, mtr = mtr, region_view = region_view,
+           selected_macro = sel_macro, selected_micro = sel_micro)
+    }) %>% shiny::debounce(120)
+
+    observeEvent(.redraw_req(), {
+      req0 <- .redraw_req()
+      k <- paste0(req0$y, "|", req0$lvl, "|", req0$uf %||% "", "|", req0$mun %||% "", "|", req0$mtr,
+                  "|", req0$region_view %||% "MUN", "|ma:", req0$selected_macro %||% "", "|mi:", req0$selected_micro %||% "")
+      if (identical(k, last_key())) return()
+      last_key(k)
+
+      show_busy(TRUE)
+      on.exit(show_busy(FALSE), add = TRUE)
+
+      try(redraw(req0$y, req0$lvl, req0$uf, req0$mun, req0$mtr, req0$region_view,
+                 req0$selected_macro, req0$selected_micro), silent = TRUE)
+      invisible(NULL)
+    }, ignoreInit = FALSE)
+
+    observeEvent(input$municipio_search, {
+      if (isTRUE(lock_recife)) return()
+      m <- .to_mun7(input$municipio_search)
+      if (is.na(m) || !nzchar(m)) return()
+      set_region_view("MUN")
+      set_selected_macro(NULL)
+      set_selected_micro(NULL)
+      set_uf("PE")
+      set_level("MUN")
+      set_mun(m)
+    }, ignoreInit = TRUE)
+
+    observeEvent(input$clear_bairro, {
+      if (!isTRUE(lock_recife)) return()
+      set_selected_bairro(NULL, NULL)
+      .draw_recife_selection(.safe_proxy(), NULL)
+      .invalidate()
+    }, ignoreInit = TRUE)
+
+    # ----------------------------
+    # Click navigation
+    # ----------------------------
+    observeEvent(input$map_shape_click, {
+      click <- input$map_shape_click
+      if (is.null(click$id) || !nzchar(click$id)) return()
+
+      if (isTRUE(lock_recife)) {
+        layer_id <- as.character(click$id[[1]])
+        if (!startsWith(layer_id, "recife_bairro_") || is.null(recife_bairros_current)) return()
+
+        idx <- match(layer_id, as.character(recife_bairros_current$shape_layer_id))
+        if (!is.finite(idx) || idx < 1 || idx > nrow(recife_bairros_current)) return()
+
+        bairro_key <- as.character(recife_bairros_current$shape_key[[idx]] %||% "")
+        bairro_name <- as.character(recife_bairros_current$shape_name[[idx]] %||% bairro_key)
+        if (!nzchar(bairro_key)) return()
+
+        current_key <- as.character(
+          .obj_get(nav, "selected_bairro_key", NULL) %||%
+            .obj_get(state, "selected_bairro_key", NULL) %||% ""
+        )
+        if (identical(current_key, bairro_key)) {
+          set_selected_bairro(NULL, NULL)
+          .draw_recife_selection(.safe_proxy(), NULL)
+        } else {
+          set_selected_bairro(bairro_key, bairro_name)
+          .draw_recife_selection(.safe_proxy(), bairro_key)
+        }
+        .invalidate()
+        return()
+      }
+
+      lvl <- toupper(as.character(get_level() %||% "UF"))
+
+      if (lvl == "BR") {
+        u <- .to_uf(click$id)
+        if (!is.na(u) && nzchar(u)) {
+          set_level("UF"); set_uf(u); set_mun(NULL)
+          set_selected_macro(NULL); set_selected_micro(NULL)
+        }
+        return()
+      }
+
+      if (lvl == "UF") {
+        rv <- get_region_view()
+
+        # Drill-down: MACRO → MICRO (show micros inside clicked macro)
+        if (identical(rv, "MACRO")) {
+          macro_key <- as.character(click$id)
+          set_selected_macro(macro_key)
+          set_selected_micro(NULL)
+          set_region_view("MICRO")
+          return()
+        }
+
+        # Drill-down: MICRO → MUN (show municipalities inside clicked micro)
+        if (identical(rv, "MICRO")) {
+          micro_key <- as.character(click$id)
+          set_selected_micro(micro_key)
+          set_selected_macro(get_selected_macro())
+          set_region_view("MUN")
+          return()
+        }
+
+        # MUN view: select municipality
+        m <- .to_mun7(click$id)
+        if (!is.na(m) && nzchar(m)) {
+          set_level("MUN"); set_mun(m)
+        }
+        return()
+      }
+
+      if (lvl == "MUN") {
+        m <- .to_mun7(click$id)
+        if (!is.na(m) && nzchar(m)) {
+          set_mun(m)
+        }
+        return()
+      }
+    }, ignoreInit = TRUE)
+
+    observeEvent(input$map_back_click, {
+      if (isTRUE(lock_recife)) {
+        if (is.null(get_selected_bairro_key())) return()
+        set_selected_bairro(NULL, NULL)
+        .draw_recife_selection(.safe_proxy(), NULL)
+        .invalidate()
+        return()
+      }
+      lvl <- toupper(as.character(get_level() %||% "UF"))
+      rv  <- get_region_view()
+
+      if (lvl == "MUN") {
+        set_level("UF"); set_mun(NULL)
+        # If we drilled from micro → mun, go back to micro
+        if (!is.null(get_selected_micro())) {
+          set_selected_micro(NULL)
+          set_region_view("MICRO")
+        }
+      } else if (lvl == "UF") {
+        # If viewing micros with a macro filter, go back to macro view
+        if (identical(rv, "MICRO") && !is.null(get_selected_macro())) {
+          set_selected_macro(NULL)
+          set_region_view("MACRO")
+        } else if (identical(rv, "MUN") && !is.null(get_selected_micro())) {
+          # Edge case: mun view with micro filter → back to micro
+          set_selected_micro(NULL)
+          set_region_view("MICRO")
+        } else {
+          # Pernambuco é o limite superior deste app; não sobe para BR.
+          if (!identical(.to_uf(get_uf()), "PE")) {
+            set_level("BR"); set_uf(NULL); set_mun(NULL)
+            set_selected_macro(NULL); set_selected_micro(NULL)
+          }
+        }
+      }
+      later::later(function() { try(.invalidate(), silent = TRUE) }, delay = 0.06)
+      later::later(function() { try(.invalidate(), silent = TRUE) }, delay = 0.18)
+      later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.22)
+      later::later(function() { try(.bind_hover_now(), silent = TRUE) }, delay = 0.42)
+    }, ignoreInit = TRUE)
+
+    list(
+      ano = reactive({
+        y <- suppressWarnings(as.integer(.obj_get(state, "ano", NA_integer_)))
+        if (!is.finite(y)) suppressWarnings(as.integer(.obj_get(cfg, "YEAR_MAX", 2025L))) else y
+      }),
+      metric = reactive({
+        m <- as.character(.obj_get(state, "metric", "incid") %||% "incid")
+        if (!m %in% c("incid", "cases", "obitos", "cura", "pop")) "incid" else m
+      })
+    )
+  })
+}

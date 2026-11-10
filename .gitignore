@@ -1,0 +1,131 @@
+# =============================================================================
+# .gitignore -- Painel de Monitoramento da Tuberculose (Recife)
+#
+# REGRA DE OURO: nenhum dado entra no repositorio.
+# A pasta data/ contem microdados do SINAN e do SIM com dados pessoais
+# identificados (nome do paciente, nome da mae, CNS, telefone, endereco,
+# latitude/longitude). Isso e dado sensivel de saude (LGPD, art. 5o, II e 11).
+# Os dados sao distribuidos fora do git -- ver README.md, secao "Dados".
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1) DADOS -- ignora tudo em data/, exceto as imagens do cabecalho
+# -----------------------------------------------------------------------------
+/data/*
+!/data/Imagens/
+!/data/Imagens/**
+
+# Rede de seguranca: formatos de dado em QUALQUER lugar do repositorio,
+# caso alguem copie um arquivo para fora de data/ por engano.
+*.parquet
+*.feather
+*.arrow
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.ods
+*.dbc
+*.dbf
+*.DBF
+*.DBC
+*.rds
+*.RDS
+*.rda
+*.RData
+*.Rdata
+*.sav
+*.dta
+*.sqlite
+*.db
+*.duckdb
+*.duckdb.wal
+
+# Shapefiles e afins
+*.shp
+*.shx
+*.sbn
+*.sbx
+*.prj
+*.cpg
+*.qpj
+*.shp.xml
+*.gpkg
+*.geojson
+
+# Pacotes compactados (o dash_monitoramento.zip tem os dados completos)
+*.zip
+*.7z
+*.rar
+*.gz
+*.tar
+
+# Marcadores de escrita do pipeline (_ok, _SUCCESS)
+_ok
+_SUCCESS
+
+# -----------------------------------------------------------------------------
+# 2) SEGREDOS E CONFIGURACAO LOCAL
+# -----------------------------------------------------------------------------
+.Renviron
+.Renviron.*
+!.Renviron.example
+.env
+.env.*
+*.pem
+*.key
+
+# -----------------------------------------------------------------------------
+# 3) LOGS E SAIDAS DE EXECUCAO
+#    (run.ps1 grava aqui scripts com caminhos absolutos da maquina;
+#     os perfis gravam recortes agregados dos dados)
+# -----------------------------------------------------------------------------
+/shiny/logs/
+*.log
+*.out
+Rprof.out
+
+# -----------------------------------------------------------------------------
+# 4) CACHE DO SHINY / BSLIB
+# -----------------------------------------------------------------------------
+app_cache/
+.sass-cache/
+rsconnect/
+
+# -----------------------------------------------------------------------------
+# 5) R / RStudio / renv
+# -----------------------------------------------------------------------------
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj.user
+.httr-oauth
+/shiny/renv/library/
+/shiny/renv/local/
+/shiny/renv/cellar/
+/shiny/renv/lock/
+/shiny/renv/python/
+/shiny/renv/sandbox/
+/shiny/renv/staging/
+
+# -----------------------------------------------------------------------------
+# 6) Sistema operacional / editores
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
+*.tmp
+*.swp
+.vscode/
+.idea/
+
+# -----------------------------------------------------------------------------
+# 7) EXCECAO: tabelas de referencia do ETL (fica no fim para valer sobre *.csv)
+#    So agregados publicos e o dicionario de codigos do SINAN -- nenhum dado
+#    individual. Antes de adicionar um CSV novo aqui, confira que nao tem
+#    linha por paciente nem texto livre da notificacao.
+# -----------------------------------------------------------------------------
+!/etl/ref/*.csv

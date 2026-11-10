@@ -1,0 +1,2561 @@
+# core/R/modules/mod_data.R
+
+suppressPackageStartupMessages({
+  library(arrow)
+  library(dplyr)
+  library(rlang)
+})
+
+if (!exists("%||%", mode = "function", inherits = TRUE)) {
+  `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+}
+
+mod_data_init <- local({
+
+  # -----------------------------
+  # Utilitários básicos
+  # -----------------------------
+  .res <- function(x) {
+    if (is.null(x)) return(NULL)
+    if (is.function(x)) return(tryCatch(x(), error = function(e) NULL))
+    x
+  }
+
+  .as_int1 <- function(x, default = NA_integer_) {
+    x <- .res(x)
+    v <- suppressWarnings(as.integer(x))
+    if (length(v) == 0) return(default)
+    v <- v[!is.na(v)]
+    if (length(v) == 0) return(default)
+    out <- v[[1]]
+    if (!is.finite(out)) default else out
+  }
+
+  .as_chr1 <- function(x, default = NULL) {
+    x <- .res(x)
+    if (is.null(x) || length(x) == 0) return(default)
+    v <- as.character(x)
+    v <- v[!is.na(v) & nzchar(v)]
+    if (length(v) == 0) default else v[[1]]
+  }
+
+  .as_num <- function(x) suppressWarnings(as.numeric(x))
+  .normpath <- function(p) normalizePath(p, winslash = "/", mustWork = FALSE)
+
+  .is_debug <- function() {
+    v <- Sys.getenv("SINAN_DEBUG", unset = "")
+    nzchar(v) && tolower(v) %in% c("1", "true", "yes", "y", "on")
+  }
+
+  .make_logger <- function() {
+    logs <- character(0)
+    push <- function(level, msg, ctx = NULL) {
+      ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      if (!is.null(ctx) && length(ctx) > 0) {
+        ctx_txt <- paste0(
+          names(ctx), "=",
+          vapply(ctx, function(x) paste(x, collapse = ","), character(1)),
+          collapse = " | "
+        )
+        line <- paste0("[", ts, "][", level, "] ", msg, " :: ", ctx_txt)
+      } else {
+        line <- paste0("[", ts, "][", level, "] ", msg)
+      }
+      logs <<- c(logs, line)
+      if (length(logs) > 1200L) logs <<- tail(logs, 1200L)
+      if (.is_debug()) message(line)
+      invisible(line)
+    }
+    list(
+      info = function(msg, ctx = NULL) push("INFO", msg, ctx),
+      warn = function(msg, ctx = NULL) push("WARN", msg, ctx),
+      err  = function(msg, ctx = NULL) push("ERROR", msg, ctx),
+      get  = function() logs
+    )
+  }
+
+  .norm_str <- function(x) {
+    if (is.null(x)) return(character(0))
+    x <- as.character(x)
+    x <- iconv(x, from = "", to = "ASCII//TRANSLIT")
+    x <- toupper(x)
+    x <- trimws(x)
+    x
+  }
+
+  # -----------------------------
+  # Níveis / doença
+  # -----------------------------
+  .norm_level <- function(level) {
+    lvl <- .norm_str(level %||% "UF")
+    if (!length(lvl) || !nzchar(lvl[[1]])) return("UF")
+    lvl <- lvl[[1]]
+    if (lvl %in% c("MUNICIPIO", "MUNICIPIOS", "MUN_IN", "MUNINC", "MUNIN")) lvl <- "MUN"
+    if (!lvl %in% c("BR", "UF", "MUN")) "UF" else lvl
+  }
+
+  .norm_doenca <- function(doenca) {
+    d <- .norm_str(doenca)
+    if (!length(d) || !nzchar(d[[1]])) return(character(0))
+    d <- d[[1]]
+    c(d)
+  }
+
+  .inc_level_candidates <- function(lvl) {
+    lvl <- .norm_level(lvl)
+    if (identical(lvl, "MUN")) return(c("MUN", "MUNIN"))
+    c(lvl)
+  }
+
+  .pick <- function(nms, candidates) {
+    hit <- candidates[candidates %in% nms]
+    if (length(hit) == 0) NULL else hit[[1]]
+  }
+
+  # -----------------------------
+  # FS helpers
+  # -----------------------------
+  .has_parquet <- function(path, max_dirs = 1500L, max_depth = 9L) {
+    if (is.null(path) || !dir.exists(path)) return(FALSE)
+
+    x <- tryCatch(
+      list.files(path, pattern = "\\.parquet$", full.names = FALSE, recursive = FALSE),
+      error = function(e) character(0)
+    )
+    if (length(x) > 0) return(TRUE)
+
+    q_dir <- path
+    q_dep <- 0L
+    scanned <- 0L
+
+    while (length(q_dir) > 0) {
+      cur <- q_dir[[1]]
+      dep <- q_dep[[1]]
+      q_dir <- q_dir[-1]
+      q_dep <- q_dep[-1]
+
+      if (dep >= max_depth) next
+
+      subs <- tryCatch(list.files(cur, full.names = TRUE, recursive = FALSE), error = function(e) character(0))
+      subs <- subs[dir.exists(subs)]
+      if (length(subs) == 0) next
+
+      for (s in subs) {
+        scanned <- scanned + 1L
+
+        x2 <- tryCatch(
+          list.files(s, pattern = "\\.parquet$", full.names = FALSE, recursive = FALSE),
+          error = function(e) character(0)
+        )
+        if (length(x2) > 0) return(TRUE)
+
+        if (scanned >= max_dirs) return(TRUE) # “provável” que exista; evita varrer árvore gigante
+
+        q_dir <- c(q_dir, s)
+        q_dep <- c(q_dep, dep + 1L)
+      }
+    }
+
+    FALSE
+  }
+
+  .find_existing_dir <- function(cands) {
+    cands <- as.character(cands)
+    cands <- cands[!is.na(cands) & nzchar(cands)]
+    for (p in cands) {
+      if (dir.exists(p) && .has_parquet(p)) return(.normpath(p))
+    }
+    NULL
+  }
+
+  # -----------------------------
+  # Paths do projeto 
+  # -----------------------------
+  .cfg_paths <- function(cfg) {
+    p <- .res(cfg$PATHS)
+    if (is.null(p) || !is.list(p)) list() else p
+  }
+
+  .cfg_path_get <- function(cfg, key, default = NULL) {
+    p <- .cfg_paths(cfg)
+    out <- .res(p[[key]])
+    if (!is.null(out) && length(out) > 0) return(out)
+    .res(cfg[[key]]) %||% default
+  }
+
+  .infer_dashboard_dir_from_paths <- function(paths) {
+    paths <- unlist(paths, use.names = FALSE)
+    paths <- as.character(paths)
+    paths <- paths[!is.na(paths) & nzchar(paths)]
+    if (length(paths) == 0) return(NULL)
+
+    paths <- .normpath(paths)
+
+    patterns <- c(
+      "/data/parquet",
+      "/parquet",
+      "/data\\\\parquet",
+      "\\\\data\\\\parquet",
+      "\\\\parquet"
+    )
+
+    for (p in paths) {
+      p2 <- gsub("\\\\", "/", p)
+      for (pat in patterns) {
+        pat2 <- gsub("\\\\", "/", pat)
+        m <- regexpr(pat2, p2, fixed = TRUE)
+        if (m[1] > 0) {
+          dash <- substr(p2, 1, m[1] + nchar(pat2) - 1)
+          if (dir.exists(dash)) return(.normpath(dash))
+        }
+      }
+      if (grepl("/data/parquet/", p2, fixed = TRUE)) {
+        dash <- sub("^(.*?/data/parquet)/.*$", "\\1", p2)
+        if (dir.exists(dash)) return(.normpath(dash))
+      }
+      if (grepl("/data/parquet$", p2, fixed = TRUE)) {
+        if (dir.exists(p2)) return(.normpath(p2))
+      }
+    }
+
+    NULL
+  }
+
+  .dashboard_dir <- function(cfg) {
+    cfg <- cfg %||% list()
+
+    dash <- .res(cfg$DASHBOARD_DIR %||% cfg$dashboard_dir %||% NULL)
+    if (is.character(dash) && nzchar(dash) && dir.exists(dash)) return(.normpath(dash))
+
+    p <- .cfg_paths(cfg)
+    guess <- .infer_dashboard_dir_from_paths(c(
+      .cfg_path_get(cfg, "PATH_TS"),
+      .cfg_path_get(cfg, "PATH_TIME_SERIES"),
+      .cfg_path_get(cfg, "PATH_INCIDENCE"),
+      .cfg_path_get(cfg, "PATH_INCIDENCIA"),
+      .cfg_path_get(cfg, "PATH_PIRAMIDES"),
+      .cfg_path_get(cfg, "PATH_PYRAMIDS"),
+      .cfg_path_get(cfg, "PATH_CATEGORICAS"),
+      .cfg_path_get(cfg, "PATH_LANDING"),
+      .cfg_path_get(cfg, "PATH_SINAN_LANDING"),
+      unlist(p, use.names = FALSE),
+      .res(cfg$PARQ_ROOT), .res(cfg$parq_root),
+      .res(cfg$ROOT), .res(cfg$root)
+    ))
+    if (!is.null(guess)) return(guess)
+
+    root <- .res(cfg$ROOT %||% cfg$root %||% NULL)
+    if (is.character(root) && nzchar(root)) {
+      cand <- file.path(root, "data", "parquet")
+      if (dir.exists(cand)) return(.normpath(cand))
+    }
+
+    parq_root <- .res(cfg$PARQ_ROOT %||% cfg$parq_root %||% NULL)
+    if (is.character(parq_root) && nzchar(parq_root)) {
+      cand1 <- parq_root
+      if (dir.exists(cand1)) return(.normpath(cand1))
+      cand2 <- file.path(parq_root, "data", "parquet")
+      if (dir.exists(cand2)) return(.normpath(cand2))
+    }
+
+    wd <- .normpath(tryCatch(getwd(), error = function(e) "."))
+    p0 <- wd
+    for (i in 0:14) {
+      cand <- file.path(p0, "data", "parquet")
+      if (dir.exists(cand)) return(.normpath(cand))
+      cand2 <- file.path(p0, "parquet")
+      if (dir.exists(cand2)) return(.normpath(cand2))
+      p2 <- dirname(p0)
+      if (identical(p2, p0)) break
+      p0 <- p2
+    }
+
+    .normpath(file.path(getwd(), "data", "parquet"))
+  }
+
+  .base_path_ts <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+    .find_existing_dir(c(
+      file.path(dash, "_cache_ts")
+    ))
+  }
+
+  .base_path_inc <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+    .find_existing_dir(c(
+      file.path(dash, "incidence")
+    ))
+  }
+
+  .base_path_pyr <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+    .find_existing_dir(c(
+      file.path(dash, "piramides")
+    ))
+  }
+
+  .base_path_cat <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+    .find_existing_dir(c(
+      file.path(dash, "sinan_landing")
+    ))
+  }
+
+  .base_path_cases_0a14 <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+    root <- .res(cfg$ROOT %||% cfg$root %||% NULL)
+    parq_root <- .res(cfg$PARQ_ROOT %||% cfg$parq_root %||% NULL)
+
+    env_path <- Sys.getenv("SINAN_CASES_0A14", unset = "")
+    if (nzchar(env_path)) {
+      cand <- .find_existing_dir(c(
+        file.path(env_path, "casos_0a14"),
+        file.path(env_path, "cases_0a14"),
+        env_path
+      ))
+      if (!is.null(cand)) return(cand)
+    }
+
+    cands <- c(
+      file.path(dash, "casos_0a14", "casos_0a14"),
+      file.path(dash, "cases_0a14", "cases_0a14"),
+      file.path(dash, "casos_0a14"),
+      file.path(dash, "cases_0a14"),
+      if (nzchar(parq_root)) file.path(parq_root, "casos_0a14", "casos_0a14") else NULL,
+      if (nzchar(parq_root)) file.path(parq_root, "casos_0a14") else NULL,
+      if (nzchar(root)) file.path(root, "casos_0a14", "casos_0a14") else NULL,
+      if (nzchar(root)) file.path(dirname(root), "casos_0a14", "casos_0a14") else NULL,
+      if (nzchar(root)) file.path(root, "casos_0a14") else NULL,
+      if (nzchar(root)) file.path(dirname(root), "casos_0a14") else NULL
+    )
+
+    .find_existing_dir(cands)
+  }
+
+  .path_mun_centroids <- function(cfg) {
+    dash <- .dashboard_dir(cfg)
+
+    p1 <- file.path(dash, "_geo_cache", "municipios_centroids.parquet")
+    if (file.exists(p1)) return(.normpath(p1))
+    p2 <- file.path(dash, "municipios_centroids.parquet")
+    if (file.exists(p2)) return(.normpath(p2))
+
+    d1 <- file.path(dash, "dim_geo", "municipios_centroids")
+    if (dir.exists(d1) && .has_parquet(d1)) return(.normpath(d1))
+
+    NULL
+  }
+
+  # -----------------------------
+  # UF / município normalização
+  # -----------------------------
+  .UF_CODE_TO_SIGLA <- c(
+    `11`="RO",`12`="AC",`13`="AM",`14`="RR",`15`="PA",`16`="AP",`17`="TO",
+    `21`="MA",`22`="PI",`23`="CE",`24`="RN",`25`="PB",`26`="PE",`27`="AL",`28`="SE",`29`="BA",
+    `31`="MG",`32`="ES",`33`="RJ",`35`="SP",
+    `41`="PR",`42`="SC",`43`="RS",
+    `50`="MS",`51`="MT",`52`="GO",`53`="DF"
+  )
+
+  .UF_NAME_TO_SIGLA <- c(
+    "ACRE"="AC","ALAGOAS"="AL","AMAPA"="AP","AMAZONAS"="AM","BAHIA"="BA","CEARA"="CE",
+    "DISTRITO FEDERAL"="DF","ESPIRITO SANTO"="ES","GOIAS"="GO","MARANHAO"="MA",
+    "MATO GROSSO"="MT","MATO GROSSO DO SUL"="MS","MINAS GERAIS"="MG","PARA"="PA",
+    "PARAIBA"="PB","PARANA"="PR","PERNAMBUCO"="PE","PIAUI"="PI","RIO DE JANEIRO"="RJ",
+    "RIO GRANDE DO NORTE"="RN","RIO GRANDE DO SUL"="RS","RONDONIA"="RO","RORAIMA"="RR",
+    "SANTA CATARINA"="SC","SAO PAULO"="SP","SERGIPE"="SE","TOCANTINS"="TO"
+  )
+
+  .to_uf <- function(x) {
+    if (is.null(x)) return(NA_character_)
+    x <- as.character(x)
+    x <- trimws(x)
+    x <- ifelse(nzchar(x), x, NA_character_)
+    if (all(is.na(x))) return(x)
+
+    x_up <- .norm_str(x)
+    is_num <- !is.na(x_up) & grepl("^[0-9]+$", x_up)
+    if (any(is_num)) x_up[is_num] <- unname(.UF_CODE_TO_SIGLA[x_up[is_num]])
+
+    needs_map <- !is.na(x_up) & (nchar(x_up) != 2 | grepl("\\s", x_up))
+    if (any(needs_map)) {
+      mapped <- unname(.UF_NAME_TO_SIGLA[x_up[needs_map]])
+      x_up[needs_map] <- mapped
+    }
+
+    x_up <- ifelse(!is.na(x_up) & nzchar(x_up), x_up, NA_character_)
+    x_up
+  }
+
+  .to_mun7 <- function(x) {
+    if (is.null(x)) return(NA_character_)
+    x <- as.character(x)
+    x <- gsub("\\D+", "", x)
+    x <- ifelse(nzchar(x), x, NA_character_)
+    if (all(is.na(x))) return(x)
+
+    out <- x
+    short <- !is.na(out) & nchar(out) < 7
+    if (any(short)) {
+      tmp <- sprintf("%7s", out[short])
+      tmp <- gsub(" ", "0", tmp)
+      out[short] <- tmp
+    }
+    long <- !is.na(out) & nchar(out) > 7
+    if (any(long)) out[long] <- substr(out[long], 1, 7)
+    out
+  }
+
+  # -----------------------------
+  # Arrow dataset open/collect
+  # -----------------------------
+  .open_dataset_args <- function(fn, sources, base_dir = NULL, partitioning = "hive") {
+    fml <- tryCatch(names(formals(fn)), error = function(e) character(0))
+    args <- list(sources = sources, format = "parquet")
+
+    if (!is.null(partitioning) && "partitioning" %in% fml) args$partitioning <- partitioning
+    if ("unify_schemas" %in% fml) args$unify_schemas <- TRUE
+    if ("use_threads" %in% fml) args$use_threads <- TRUE
+    if ("ignore_invalid_files" %in% fml) args$ignore_invalid_files <- TRUE
+
+    if (!is.null(base_dir) && !is.null(partitioning) && "partition_base_dir" %in% fml) {
+      args$partition_base_dir <- base_dir
+    }
+
+    args
+  }
+
+  # Limitar a listagem dos parquets para evitar o crash  
+  .parquet_files_limited <- function(root, max_files = 12000L, max_depth = 7L) {
+    if (is.null(root) || !dir.exists(root)) return(character(0))
+    max_files <- as.integer(max_files %||% 12000L)
+    max_depth <- as.integer(max_depth %||% 7L)
+    if (!is.finite(max_files) || max_files <= 0) max_files <- 12000L
+    if (!is.finite(max_depth) || max_depth <= 0) max_depth <- 7L
+
+    out <- character(0)
+    q_dir <- root
+    q_dep <- 0L
+
+    while (length(q_dir) > 0) {
+      cur <- q_dir[[1]]
+      dep <- q_dep[[1]]
+      q_dir <- q_dir[-1]
+      q_dep <- q_dep[-1]
+
+      if (dep > max_depth) next
+
+      files <- tryCatch(list.files(cur, pattern = "\\.parquet$", full.names = TRUE, recursive = FALSE), error = function(e) character(0))
+      if (length(files) > 0) {
+        out <- c(out, files)
+        if (length(out) >= max_files) {
+          out <- out[seq_len(max_files)]
+          break
+        }
+      }
+
+      subs <- tryCatch(list.files(cur, full.names = TRUE, recursive = FALSE), error = function(e) character(0))
+      subs <- subs[dir.exists(subs)]
+      if (length(subs) > 0) {
+        q_dir <- c(q_dir, subs)
+        q_dep <- c(q_dep, rep(dep + 1L, length(subs)))
+      }
+    }
+
+    out <- out[!is.na(out) & nzchar(out)]
+    if (length(out) > max_files) out <- out[seq_len(max_files)]
+    out
+  }
+
+  .open_ds_cached <- function(root, cache_env, logger = NULL, tag = NULL) {
+    if (is.null(root)) return(NULL)
+    key <- paste0("ds|", .normpath(root))
+    if (exists(key, envir = cache_env, inherits = FALSE)) {
+      return(get(key, envir = cache_env, inherits = FALSE))
+    }
+
+    fn <- arrow::open_dataset
+    ds <- NULL
+
+    .try_open <- function(sources, base_dir = NULL, partitioning = "hive") {
+      args <- .open_dataset_args(fn, sources = sources, base_dir = base_dir, partitioning = partitioning)
+      tryCatch(do.call(fn, args), error = function(e) e)
+    }
+
+    if (dir.exists(root)) {
+      ds <- .try_open(root, base_dir = NULL, partitioning = "hive")
+      if (inherits(ds, "error")) {
+        ds2 <- .try_open(root, base_dir = NULL, partitioning = NULL)
+        if (!inherits(ds2, "error")) ds <- ds2
+      }
+
+      if (inherits(ds, "error")) {
+        files <- .parquet_files_limited(root, max_files = 12000L, max_depth = 7L)
+        if (length(files) > 0) {
+          ds3 <- .try_open(files, base_dir = root, partitioning = "hive")
+          if (inherits(ds3, "error")) {
+            ds4 <- .try_open(files, base_dir = root, partitioning = NULL)
+            if (!inherits(ds4, "error")) ds3 <- ds4
+          }
+          if (!inherits(ds3, "error")) ds <- ds3
+        }
+      }
+
+      if (inherits(ds, "error")) {
+        if (!is.null(logger)) logger$err(
+          "open_dataset falhou",
+          list(tag = tag %||% "", root = root, err = conditionMessage(ds))
+        )
+        ds <- NULL
+      }
+    } else if (file.exists(root) && grepl("\\.parquet$", root, ignore.case = TRUE)) {
+      ds <- .try_open(root, base_dir = dirname(root), partitioning = NULL)
+      if (inherits(ds, "error")) {
+        if (!is.null(logger)) logger$err(
+          "open_dataset(file) falhou",
+          list(tag = tag %||% "", root = root, err = conditionMessage(ds))
+        )
+        ds <- NULL
+      }
+    }
+
+    assign(key, ds, envir = cache_env)
+    ds
+  }
+
+  .ds_cols <- function(x) {
+    if (is.null(x)) return(character(0))
+    out <- tryCatch({
+      sc <- arrow::schema(x)
+      if (!is.null(sc)) sc$names else character(0)
+    }, error = function(e) character(0))
+    if (length(out) > 0) return(out)
+    tryCatch(x$schema$names, error = function(e) character(0))
+  }
+
+  .ds_field_type <- function(x, col) {
+    if (is.null(x) || is.null(col) || !nzchar(col)) return("")
+    col <- as.character(col)[[1]]
+
+    typ <- tryCatch({
+      sc <- arrow::schema(x)
+      f <- sc$GetFieldByName(col)
+      if (is.null(f)) "" else tolower(f$type$ToString())
+    }, error = function(e) "")
+
+    if (nzchar(typ)) return(typ)
+
+    tryCatch({
+      f <- x$schema$GetFieldByName(col)
+      if (is.null(f)) "" else tolower(f$type$ToString())
+    }, error = function(e) "")
+  }
+
+  .coerce_for_col <- function(ds, col, values) {
+    typ <- .ds_field_type(ds, col)
+    if (!nzchar(typ)) return(values)
+    if (grepl("int|uint|float|double|decimal", typ)) {
+      suppressWarnings(as.numeric(values))
+    } else if (grepl("bool", typ)) {
+      as.logical(values)
+    } else {
+      as.character(values)
+    }
+  }
+
+  .ds_filter_in <- function(q, col, values) {
+    if (is.null(q)) return(NULL)
+    if (!(col %in% .ds_cols(q))) return(q)
+    values <- unlist(values, use.names = FALSE)
+    values <- .coerce_for_col(q, col, values)
+    values <- values[!is.na(values)]
+    if (is.character(values)) values <- values[nzchar(values)]
+    if (length(values) == 0) return(q)
+    tryCatch(q %>% dplyr::filter(.data[[col]] %in% values), error = function(e) q)
+  }
+
+  .ds_filter_eq <- function(q, col, value) {
+    if (is.null(q)) return(NULL)
+    if (!(col %in% .ds_cols(q))) return(q)
+    value <- unlist(value, use.names = FALSE)
+    if (length(value) == 0) return(q)
+    value <- .coerce_for_col(q, col, value[[1]])
+    if (is.null(value) || (is.character(value) && !nzchar(value))) return(q)
+    if (is.numeric(value) && !is.finite(value)) return(q)
+    tryCatch(q %>% dplyr::filter(.data[[col]] == value), error = function(e) q)
+  }
+
+  .ds_select_keep <- function(q, keep_cols) {
+    if (is.null(q)) return(NULL)
+    if (!is.character(keep_cols) || length(keep_cols) == 0) return(q)
+    cols <- .ds_cols(q)
+    keep <- intersect(cols, keep_cols)
+    if (length(keep) == 0) return(q)
+    tryCatch(q %>% select(all_of(keep)), error = function(e) q)
+  }
+
+  .read_ds_fast <- function(root, cache_env, filters = list(), keep_cols = NULL, logger = NULL, tag = NULL) {
+    if (is.null(root)) {
+      if (!is.null(logger)) logger$warn("root NULL", list(tag = tag %||% ""))
+      return(data.frame())
+    }
+    if (!(dir.exists(root) || (file.exists(root) && grepl("\\.parquet$", root, ignore.case = TRUE)))) {
+      if (!is.null(logger)) logger$warn("root inválido", list(tag = tag %||% "", root = root))
+      return(data.frame())
+    }
+    if (dir.exists(root) && !.has_parquet(root)) {
+      if (!is.null(logger)) logger$warn("root sem parquet", list(tag = tag %||% "", root = root))
+      return(data.frame())
+    }
+
+    ds <- .open_ds_cached(root, cache_env, logger = logger, tag = tag)
+    if (is.null(ds)) {
+      if (!is.null(logger)) logger$err("open_dataset falhou (ds NULL)", list(tag = tag %||% "", root = root))
+      return(data.frame())
+    }
+
+    q <- ds
+    cols <- .ds_cols(q)
+
+    if (length(filters) > 0) {
+      for (k in names(filters)) {
+        v <- filters[[k]]
+        if (is.null(v) || !(k %in% cols)) next
+        if (length(v) > 1) q <- .ds_filter_in(q, k, v) else q <- .ds_filter_eq(q, k, v[[1]])
+      }
+    }
+
+    if (is.character(keep_cols) && length(keep_cols) > 0) q <- .ds_select_keep(q, keep_cols)
+
+    out <- tryCatch(q %>% dplyr::collect(), error = function(e) {
+      if (!is.null(logger)) logger$err("collect() falhou", list(tag = tag %||% "", root = root, err = conditionMessage(e)))
+      NULL
+    })
+    if (is.null(out) || !is.data.frame(out)) out <- data.frame()
+
+    if (!is.null(logger)) {
+      logger$info("query ok", list(
+        tag = tag %||% "",
+        root = root,
+        nrow = nrow(out),
+        cols = paste(head(names(out), 60), collapse = ",")
+      ))
+    }
+
+    out
+  }
+
+  # -----------------------------
+  # Resolver diretórios particionados (HIVE e "plain")
+  # -----------------------------
+  .pyr_try_dirs <- function(base, lvl, tp, d, yy) {
+    cands <- c(
+      file.path(base, paste0("nivel=", lvl), paste0("tipo=", tp), paste0("doenca=", d), paste0("ano=", yy)),
+      file.path(base, paste0("nivel=", lvl), paste0("doenca=", d), paste0("tipo=", tp), paste0("ano=", yy)),
+      file.path(base, paste0("tipo=", tp), paste0("nivel=", lvl), paste0("doenca=", d), paste0("ano=", yy)),
+      file.path(base, paste0("ano=", yy), paste0("nivel=", lvl), paste0("tipo=", tp), paste0("doenca=", d)),
+      file.path(base, lvl, tp, d, as.character(yy)),
+      file.path(base, tp, lvl, d, as.character(yy))
+    )
+    for (p in cands) {
+      if (dir.exists(p) && .has_parquet(p)) return(.normpath(p))
+    }
+    NULL
+  }
+
+  .cat_try_dirs <- function(base, lvl, d, yy) {
+    cands <- c(
+      file.path(base, paste0("nivel=", lvl), paste0("doenca=", d), paste0("ano=", yy)),
+      file.path(base, paste0("doenca=", d), paste0("nivel=", lvl), paste0("ano=", yy)),
+      file.path(base, paste0("ano=", yy), paste0("nivel=", lvl), paste0("doenca=", d)),
+      file.path(base, lvl, d, as.character(yy)),
+      file.path(base, d, lvl, as.character(yy))
+    )
+    for (p in cands) {
+      if (dir.exists(p) && .has_parquet(p)) return(.normpath(p))
+    }
+    NULL
+  }
+
+  .ts_try_dirs <- function(base, lvl, d, yy = NULL) {
+    cands <- c(
+      if (!is.null(yy)) file.path(base, paste0("nivel=", lvl), paste0("doenca=", d), paste0("ano=", yy)),
+      if (!is.null(yy)) file.path(base, paste0("nivel=", lvl), paste0("ano=", yy), paste0("doenca=", d)),
+      if (!is.null(yy)) file.path(base, paste0("doenca=", d), paste0("nivel=", lvl), paste0("ano=", yy)),
+      file.path(base, paste0("nivel=", lvl), paste0("doenca=", d)),
+      file.path(base, paste0("doenca=", d), paste0("nivel=", lvl)),
+      file.path(base, paste0("nivel=", lvl))
+    )
+    for (p in cands) {
+      if (dir.exists(p) && .has_parquet(p)) return(.normpath(p))
+    }
+    NULL
+  }
+
+  .years_from_dirs <- function(root, parts_try = character(0)) {
+    if (is.null(root) || !dir.exists(root)) return(integer(0))
+    base <- root
+    if (length(parts_try) > 0) {
+      p1 <- file.path(root, do.call(file.path, as.list(parts_try)))
+      if (dir.exists(p1)) base <- p1
+    }
+    dd <- suppressWarnings(list.dirs(base, recursive = TRUE, full.names = FALSE))
+    if (length(dd) == 0) return(integer(0))
+    aa <- sub(".*(^|/|\\\\)ano=([0-9]{4}).*", "\\2", dd)
+    aa <- suppressWarnings(as.integer(aa))
+    aa <- aa[is.finite(aa)]
+    sort(unique(aa))
+  }
+
+  # -----------------------------
+  # Métricas / padronizações
+  # -----------------------------
+  .metric_candidates <- function(kind) {
+    if (kind == "cases")  return(c("casos_total", "casos"))
+    if (kind == "incid")  return(c("incid_100k_total", "incid_100k"))
+    if (kind == "pop")    return(c("pop_total"))
+    if (kind == "obitos") return(c("casos_obitos"))
+    if (kind == "cura")   return(c("casos_cura"))
+    character(0)
+  }
+
+  .col_pick_norm <- function(nms, candidates) {
+    if (is.null(nms)) return(NULL)
+    if (is.data.frame(nms)) nms <- names(nms)
+    nms <- as.character(nms)
+    nms <- nms[!is.na(nms) & nzchar(nms)]
+    if (length(nms) == 0) return(NULL)
+
+    norm_nms <- .norm_str(nms)
+    for (c in candidates) {
+      cc <- .norm_str(c)
+      i <- match(cc, norm_nms)
+      if (!is.na(i)) return(nms[[i]])
+    }
+    NULL
+  }
+
+  .std_ts_out <- function(df) {
+    if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+    nms <- names(df)
+
+    # ---- chaves temporais
+    if (!"ano" %in% nms && "ANO" %in% nms) df$ano <- df$ANO
+    if (!"mes" %in% nms && "MES" %in% nms) df$mes <- df$MES
+    if (!"semana" %in% nms && "SE" %in% nms) df$semana <- df$SE
+    if (!"semana" %in% nms && "SEMANA" %in% nms) df$semana <- df$SEMANA
+
+    df$ano <- suppressWarnings(as.integer(df$ano))
+    if ("mes" %in% names(df)) df$mes <- suppressWarnings(as.integer(df$mes))
+    if ("semana" %in% names(df)) df$semana <- suppressWarnings(as.integer(df$semana))
+
+    # ---- geo (TS usa geo_id/geo_nome)
+    if (!"geo_id" %in% nms) {
+      idc <- .pick(nms, c("geo_id","GEO_ID","cod_mun7","COD_MUN7","CD_MUN","cd_mun","mun","MUN"))
+      if (!is.null(idc)) df$geo_id <- df[[idc]]
+    }
+    if (!"geo_nome" %in% nms) {
+      nc <- .pick(nms, c("geo_nome","GEO_NOME","geo_name","NOME","nome_mun","NOME_MUN","municipio","MUNICIPIO"))
+      if (!is.null(nc)) df$geo_nome <- df[[nc]]
+    }
+
+    # uf
+    if ("uf" %in% names(df)) df$uf <- .to_uf(df$uf)
+
+    # ---- padronização de métricas (mantém os originais e cria *_total)
+    if (!"casos_total" %in% nms && "casos" %in% nms) df$casos_total <- df$casos
+    if (!"incid_100k_total" %in% nms && "incid_100k" %in% nms) df$incid_100k_total <- df$incid_100k
+    if (!"casos" %in% nms && "casos_total" %in% nms) df$casos <- df$casos_total
+    if (!"incid_100k" %in% nms && "incid_100k_total" %in% nms) df$incid_100k <- df$incid_100k_total
+
+    # coerções numéricas
+    for (cc in c("casos","casos_total","casos_obitos","casos_cura","pop_total","incid_100k","incid_100k_total")) {
+      if (cc %in% names(df)) df[[cc]] <- .as_num(df[[cc]])
+    }
+
+    # ---- geo_id: manter códigos municipais com 6/7 dígitos sem zero à esquerda
+    # Algumas bases temporais trazem município em 6 dígitos; preencher à esquerda
+    # quebra o match posterior por escopo municipal no módulo de gráficos.
+    if ("geo_id" %in% names(df)) {
+      g <- as.character(df$geo_id)
+      g <- gsub("\\D+", "", g)
+      g <- ifelse(nzchar(g), g, NA_character_)
+      long <- !is.na(g) & nchar(g) > 7
+      if (any(long)) g[long] <- substr(g[long], 1, 7)
+      short <- !is.na(g) & nchar(g) < 6
+      if (any(short)) g[short] <- NA_character_
+      df$geo_id <- g
+    }
+
+    if (!"mes_nome" %in% names(df) && "mes" %in% names(df)) {
+      mm <- c("janeiro","fevereiro","março","abril","maio","junho","julho","agosto","setembro","outubro","novembro","dezembro")
+      m <- df$mes
+      df$mes_nome <- ifelse(is.finite(m) & m >= 1 & m <= 12, mm[m], NA_character_)
+    }
+
+    df
+  }
+
+  .std_metrics_out <- function(df) {
+    if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+    nms <- names(df)
+
+    if (!"uf" %in% nms) {
+      uf_col <- .pick(nms, c("uf", "UF", "SG_UF", "sigla_uf", "SIGLA_UF", "co_uf", "CO_UF"))
+      if (!is.null(uf_col)) df$uf <- df[[uf_col]]
+    }
+    if (!"cod_mun7" %in% nms) {
+      mun_col <- .pick(nms, c("geo_id", "cod_mun7", "COD_MUN7", "CD_MUN", "cod_mun", "COD_MUN", "mun", "MUN"))
+      if (!is.null(mun_col)) df$cod_mun7 <- df[[mun_col]]
+    }
+    if (!"nome_mun" %in% nms) {
+      nm_col <- .pick(nms, c("geo_nome", "geo_name", "nome_mun", "NOME_MUN", "NM_MUN", "nome_municipio", "NOME_MUNICIPIO"))
+      if (!is.null(nm_col)) df$nome_mun <- df[[nm_col]]
+    }
+
+    if (!"casos_total" %in% nms && "casos" %in% nms) {
+      names(df)[names(df) == "casos"] <- "casos_total"
+    }
+
+    if (!"incid_100k_total" %in% nms && "incid_100k" %in% nms) {
+      names(df)[names(df) == "incid_100k"] <- "incid_100k_total"
+    }
+
+    if ("uf" %in% names(df)) df$uf <- .to_uf(df$uf)
+    if ("cod_mun7" %in% names(df)) df$cod_mun7 <- .to_mun7(df$cod_mun7)
+    df
+  }
+
+  .ensure_metrics_schema <- function(df) {
+    if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+    req_keys <- c("uf", "cod_mun7", "nome_mun")
+    for (k in req_keys) if (!k %in% names(df)) df[[k]] <- NA
+
+    req_metrics <- c("casos_total", "casos_obitos", "casos_cura", "pop_total", "incid_100k_total")
+    for (m in req_metrics) if (!m %in% names(df)) df[[m]] <- NA_real_
+
+    df$uf <- .to_uf(df$uf)
+    df$cod_mun7 <- .to_mun7(df$cod_mun7)
+    df$nome_mun <- as.character(df$nome_mun)
+
+    df$casos_total <- .as_num(df$casos_total)
+    df$casos_obitos <- .as_num(df$casos_obitos)
+    df$casos_cura <- .as_num(df$casos_cura)
+    df$pop_total <- .as_num(df$pop_total)
+    df$incid_100k_total <- .as_num(df$incid_100k_total)
+
+    df
+  }
+
+  .summarise_scope <- function(df) {
+    if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+    nms <- names(df)
+
+    c_cases <- .pick(nms, .metric_candidates("cases"))
+    c_incid <- .pick(nms, .metric_candidates("incid"))
+    c_pop   <- .pick(nms, .metric_candidates("pop"))
+    c_obt   <- .pick(nms, .metric_candidates("obitos"))
+    c_cura  <- .pick(nms, .metric_candidates("cura"))
+
+    casos_total  <- if (!is.null(c_cases)) sum(.as_num(df[[c_cases]]), na.rm = TRUE) else NA_real_
+    pop_total    <- if (!is.null(c_pop))   sum(.as_num(df[[c_pop]]),   na.rm = TRUE) else NA_real_
+    casos_obitos <- if (!is.null(c_obt))   sum(.as_num(df[[c_obt]]),   na.rm = TRUE) else NA_real_
+    casos_cura   <- if (!is.null(c_cura))  sum(.as_num(df[[c_cura]]),  na.rm = TRUE) else NA_real_
+
+    incid_100k_total <- NA_real_
+    if (!is.null(c_incid)) {
+      vv <- .as_num(df[[c_incid]])
+      vv <- vv[is.finite(vv)]
+      if (length(vv) > 0) incid_100k_total <- vv[[1]]
+    }
+    if (!is.finite(incid_100k_total) && is.finite(casos_total) && is.finite(pop_total) && pop_total > 0) {
+      incid_100k_total <- (casos_total / pop_total) * 1e5
+    }
+
+    data.frame(
+      casos_total = casos_total,
+      casos_obitos = casos_obitos,
+      casos_cura = casos_cura,
+      pop_total = pop_total,
+      incid_100k_total = incid_100k_total
+    )
+  }
+
+  .add_filters <- function(filters, keys, value) {
+    if (is.null(value) || length(value) == 0) return(filters)
+    v_chr <- as.character(value)
+    v_chr <- v_chr[!is.na(v_chr) & nzchar(v_chr)]
+    if (length(v_chr) == 0) return(filters)
+    for (k in keys) filters[[k]] <- value
+    filters
+  }
+
+  .add_filter_level  <- function(filters, lvl)  .add_filters(filters, c("nivel", "NIVEL"), lvl)
+  .add_filter_doenca <- function(filters, dd)   .add_filters(filters, c("doenca", "DOENCA"), dd)
+  .add_filter_ano    <- function(filters, yv)   .add_filters(filters, c("ano", "ANO"), yv)
+  .add_filter_tipo   <- function(filters, tp)   .add_filters(filters, c("tipo", "TIPO"), tp)
+  .add_filter_uf     <- function(filters, ufx)  .add_filters(filters, c("uf", "UF", "sg_uf", "SG_UF", "sigla_uf", "SIGLA_UF"), ufx)
+  .add_filter_mun    <- function(filters, munx) .add_filters(filters, c("geo_id", "GEO_ID", "cod_mun7", "COD_MUN7", "CD_MUN", "cd_mun", "mun", "MUN"), munx)
+  .tb_grau_value <- function(x) {
+    if (is.null(x) || length(x) == 0) return(NULL)
+    if (is.list(x) && !is.null(x$value)) x <- x$value
+    x <- as.character(unlist(x, use.names = FALSE))
+    x <- x[!is.na(x) & nzchar(x) & x != "__ALL__"]
+    if (length(x) == 0) NULL else x
+  }
+  .tb_grau_var <- function(x) {
+    if (is.list(x) && !is.null(x$var)) {
+      v <- as.character(x$var)
+      v <- v[!is.na(v) & nzchar(v)]
+      if (length(v) > 0) return(v[[1]])
+    }
+    NULL
+  }
+  .add_filter_tb_grau <- function(filters, value) {
+    val <- .tb_grau_value(value)
+    if (is.null(val)) return(filters)
+    var <- .tb_grau_var(value)
+    keys <- unique(c(
+      var,
+      "GRAU_INCAPACIDADE_FISICA", "GRAU_INCAPACIDADE", "GRAU_INCAP",
+      "grau_incapacidade_fisica", "grau_incapacidade", "grau_incap",
+      "GRAUINC", "grauinc", "NU_GRAU", "nu_grau", "TP_GRAU", "tp_grau", "AVALIA_N", "avalia_n"
+    ))
+    .add_filters(filters, keys, val)
+  }
+
+  # -----------------------------
+  # Ranking helpers
+  # -----------------------------
+  .rank_value_col <- function(cols, kind) {
+    cand <- .metric_candidates(kind)
+    .pick(cols, cand)
+  }
+
+  .kind_to_variavel <- function(kind) {
+    kind <- tolower(kind %||% "cases")
+    if (kind == "cases")  return(c("casos_total","casos"))
+    if (kind == "incid")  return(c("incid_100k_total"))
+    if (kind == "pop")    return(c("pop_total"))
+    if (kind == "obitos") return(c("casos_obitos"))
+    if (kind == "cura")   return(c("casos_cura"))
+    character(0)
+  }
+
+  .add_filter_sexo_total <- function(filters, value = NULL) {
+    # BUG CORRIGIDO: chamava .add_filters() sem o argumento obrigatorio
+    # `value`, entao SEMPRE lancava "argumento value ausente" e derrubava
+    # get_ranking() inteiro. A extracao de Recife nao tem coluna `sexo` (o
+    # schema e largo: casos_total/casos_M/casos_F), entao o comportamento
+    # pretendido aqui e nao filtrar nada -- que e o que value = NULL faz.
+    .add_filters(filters, c("sexo","cs_sexo"), value)
+  }
+
+  .query_rank_arrow <- function(ds, filters, group_cols, val_col, kind, top_n, logger = NULL, tag = NULL) {
+    if (is.null(ds)) return(data.frame())
+    q <- ds
+    cols <- .ds_cols(q)
+
+    if (length(filters) > 0) {
+      for (k in names(filters)) {
+        v <- filters[[k]]
+        if (is.null(v) || !(k %in% cols)) next
+        if (length(v) > 1) q <- .ds_filter_in(q, k, v) else q <- .ds_filter_eq(q, k, v[[1]])
+      }
+    }
+
+    cols2 <- .ds_cols(q)
+    if (!(val_col %in% cols2)) return(data.frame())
+
+    grp <- intersect(group_cols, cols2)
+    if (length(grp) == 0) return(data.frame())
+
+    tn <- suppressWarnings(as.integer(top_n))
+    if (!is.finite(tn) || tn <= 0) tn <- 15L
+
+    qq <- tryCatch({
+      if (identical(kind, "incid")) {
+        q %>%
+          group_by(!!!syms(grp)) %>%
+          summarise(val = max(.data[[val_col]], na.rm = TRUE), .groups = "drop") %>%
+          arrange(desc(.data$val)) %>%
+          head(tn)
+      } else {
+        q %>%
+          group_by(!!!syms(grp)) %>%
+          summarise(val = sum(.data[[val_col]], na.rm = TRUE), .groups = "drop") %>%
+          arrange(desc(.data$val)) %>%
+          head(tn)
+      }
+    }, error = function(e) {
+      if (!is.null(logger)) logger$err("rank arrow failed", list(tag = tag %||% "", err = conditionMessage(e)))
+      NULL
+    })
+
+    if (is.null(qq)) return(data.frame())
+
+    out <- tryCatch(qq %>% collect(), error = function(e) {
+      if (!is.null(logger)) logger$err("rank collect failed", list(tag = tag %||% "", err = conditionMessage(e)))
+      data.frame()
+    })
+
+    if (!is.data.frame(out) || nrow(out) == 0) return(data.frame())
+    out
+  }
+
+  .query_rank_long <- function(ds, filters, group_cols, kind, top_n, logger = NULL, tag = NULL) {
+    if (is.null(ds)) return(data.frame())
+    cols <- .ds_cols(ds)
+    var_col <- .pick(cols, c("variavel","VARIAVEL","var","VAR"))
+    val_col <- .pick(cols, c("valor","VALOR","value","VALUE","n","N"))
+    if (is.null(var_col) || is.null(val_col)) return(data.frame())
+
+    vv <- .kind_to_variavel(kind)
+    if (length(vv) == 0) return(data.frame())
+
+    filters2 <- filters
+    filters2 <- .add_filters(filters2, c(var_col), vv)
+
+    out <- .query_rank_arrow(
+      ds = ds,
+      filters = filters2,
+      group_cols = group_cols,
+      val_col = val_col,
+      kind = kind,
+      top_n = top_n,
+      logger = logger,
+      tag = paste0(tag %||% "rank_long")
+    )
+    out
+  }
+
+  # -----------------------------
+  # Cache compartilhado entre sessoes
+  # -----------------------------
+  # Antes, cache_env/ds_env nasciam DENTRO do entrypoint, e o entrypoint e
+  # chamado de dentro do server (app_shell.R): cada sessao Shiny reconstruia
+  # tudo do zero -- datasets Arrow reabertos, centroides recalculados, cada
+  # agregacao refeita. Agora eles vivem aqui, no escopo do local(), que e por
+  # processo R e portanto compartilhado por todas as sessoes que o processo
+  # atende (com o simple_scheduler do Shiny Server, ate 20 por padrao).
+  #
+  # O registro e chaveado pela identidade da configuracao porque ha chaves
+  # nuas no cache ("centroids", "centroids_by_uf"): sem a assinatura, duas
+  # doencas ou duas raizes de dados diferentes colidiriam silenciosamente.
+  .cache_registry <- new.env(parent = emptyenv())
+
+  .cache_signature <- function(doenca_vals, paths) {
+    partes <- c(
+      paste(sort(unique(as.character(doenca_vals))), collapse = "|"),
+      vapply(paths, function(p) paste(as.character(p %||% ""), collapse = "/"), character(1))
+    )
+    paste(partes, collapse = "::")
+  }
+
+  .cache_envs_for <- function(sig) {
+    if (exists(sig, envir = .cache_registry, inherits = FALSE)) {
+      return(get(sig, envir = .cache_registry, inherits = FALSE))
+    }
+    envs <- list(cache = new.env(parent = emptyenv()),
+                 ds    = new.env(parent = emptyenv()))
+    assign(sig, envs, envir = .cache_registry)
+    envs
+  }
+
+  # Diagnostico: quantas configuracoes distintas estao em cache no processo.
+  mod_data_cache_info <- function() {
+    sigs <- ls(envir = .cache_registry, all.names = TRUE)
+    data.frame(
+      assinatura = sigs,
+      objetos = vapply(sigs, function(s) {
+        e <- get(s, envir = .cache_registry, inherits = FALSE)
+        length(ls(envir = e$cache, all.names = TRUE))
+      }, integer(1)),
+      stringsAsFactors = FALSE
+    )
+  }
+  assign("mod_data_cache_info", mod_data_cache_info, envir = globalenv())
+
+  # -----------------------------
+  # Memoizacao de resultado dos leitores (PASSO 3)
+  # -----------------------------
+  # Os leitores custavam o mesmo em toda chamada -- 70 a 93 ms cada -- porque
+  # refaziam a consulta Arrow inteira. get_scope e get_ranking ja montavam uma
+  # cache_key propria; em vez de repetir esse codigo em mais oito funcoes,
+  # embrulhamos os getters uma vez so, na montagem da API. O embrulho nao muda
+  # a funcao: so guarda a resposta por combinacao de argumentos.
+  .args_key <- function(args) {
+    if (length(args) == 0L) return("()")
+    nm <- names(args)
+    if (is.null(nm)) nm <- rep("", length(args))
+    partes <- vapply(seq_along(args), function(i) {
+      v <- args[[i]]
+      vs <- if (is.null(v)) "NULL"
+            else if (is.atomic(v)) paste0(as.character(v), collapse = ",")
+            else paste0(as.character(unlist(v)), collapse = ",")
+      paste0(nm[[i]], "=", vs)
+    }, character(1))
+    paste(partes, collapse = "|")
+  }
+
+  .memo_wrap <- function(fn, tag, cache_env, teto = 400L) {
+    force(fn); force(tag); force(cache_env); force(teto)
+    function(...) {
+      chave <- tryCatch(paste0("memo|", tag, "|", .args_key(list(...))),
+                        error = function(e) NULL)
+      # Sem chave confiavel, chama direto: melhor lento que errado.
+      if (is.null(chave)) return(fn(...))
+      if (exists(chave, envir = cache_env, inherits = FALSE)) {
+        return(get(chave, envir = cache_env, inherits = FALSE))
+      }
+      out <- fn(...)
+      if (length(ls(envir = cache_env, all.names = TRUE)) > teto) {
+        rm(list = ls(envir = cache_env, all.names = TRUE), envir = cache_env)
+      }
+      assign(chave, out, envir = cache_env)
+      out
+    }
+  }
+
+  # -----------------------------
+  # Entrypoint
+  # -----------------------------
+  # (memoizado -- ver .api_registry logo abaixo)
+  .build_api <- function(cfg, pack = NULL) {
+    cfg  <- cfg %||% list()
+    pack <- pack %||% list()
+
+    doenca <- (pack$DOENCA %||% cfg$DOENCA) %||% ""
+    doenca_vals <- .norm_doenca(doenca)
+
+    p_ts  <- .base_path_ts(cfg)
+    p_inc <- .base_path_inc(cfg)
+    p_pyr <- .base_path_pyr(cfg)
+    p_cat <- .base_path_cat(cfg)
+    p_cases_0a14 <- .base_path_cases_0a14(cfg)
+
+    # Compartilhado por processo (ver .cache_registry acima), nao por sessao.
+    .sig   <- .cache_signature(doenca_vals, list(p_ts, p_inc, p_pyr, p_cat, p_cases_0a14))
+    .envs  <- .cache_envs_for(.sig)
+    cache_env <- .envs$cache
+    ds_env    <- .envs$ds
+
+    logger <- .make_logger()
+
+    dash_dir <- .dashboard_dir(cfg)
+    logger$info("mod_data_init", list(doenca = doenca, dash_dir = dash_dir))
+
+    diag <- list(
+      DOENCA = doenca,
+      DOENCA_VALS = doenca_vals,
+      DASHBOARD_DIR = dash_dir,
+      PATH_TS = p_ts,
+      PATH_INCIDENCE = p_inc,
+      PATH_PIRAMIDES = p_pyr,
+      PATH_SINAN_LANDING = p_cat,
+      PATH_CASES_0A14 = p_cases_0a14,
+      PATH_MUN_CENTROIDS = NULL,
+      HAS_TS = !is.null(p_ts) && dir.exists(p_ts) && .has_parquet(p_ts),
+      HAS_INCIDENCE = !is.null(p_inc) && dir.exists(p_inc) && .has_parquet(p_inc),
+      HAS_PIRAMIDES = !is.null(p_pyr) && dir.exists(p_pyr) && .has_parquet(p_pyr),
+      HAS_CASES_0A14 = !is.null(p_cases_0a14) && dir.exists(p_cases_0a14) && .has_parquet(p_cases_0a14),
+      HAS_CATEGORICAS = !is.null(p_cat) && dir.exists(p_cat) && .has_parquet(p_cat),
+      HAS_MUN_CENTROIDS = FALSE,
+      LOG = character(0),
+      LAST = list()
+    )
+
+    .diag_sync <- function() {
+      diag$LOG <<- logger$get()
+      diag
+    }
+
+    .diag_last <- function(name, ctx) {
+      diag$LAST[[name]] <<- ctx
+      invisible(NULL)
+    }
+
+    # -----------------------------
+    # Centroids (cache forte)
+    # -----------------------------
+    p_cent <- .path_mun_centroids(cfg)
+    diag$PATH_MUN_CENTROIDS <- p_cent
+    diag$HAS_MUN_CENTROIDS <- !is.null(p_cent) && (file.exists(p_cent) || (dir.exists(p_cent) && .has_parquet(p_cent)))
+
+    .load_centroids <- function() {
+      if (is.null(p_cent)) return(data.frame())
+
+      df <- data.frame()
+      if (file.exists(p_cent)) {
+        df <- tryCatch(
+          arrow::read_parquet(p_cent, col_select = c("uf", "cod_mun7", "nome_mun", "lat", "lon")),
+          error = function(e) data.frame()
+        )
+      } else if (dir.exists(p_cent) && .has_parquet(p_cent)) {
+        ds <- tryCatch(arrow::open_dataset(p_cent, format = "parquet", unify_schemas = TRUE), error = function(e) NULL)
+        if (!is.null(ds)) {
+          df <- tryCatch(
+            ds %>%
+              dplyr::select(dplyr::any_of(c("uf", "cod_mun7", "nome_mun", "lat", "lon", "UF", "COD_MUN7", "NOME_MUN"))) %>%
+              dplyr::collect(),
+            error = function(e) data.frame()
+          )
+        }
+      }
+
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      if (!"uf" %in% names(df) && "UF" %in% names(df)) df$uf <- df$UF
+      if (!"cod_mun7" %in% names(df) && "COD_MUN7" %in% names(df)) df$cod_mun7 <- df$COD_MUN7
+      if (!"nome_mun" %in% names(df) && "NOME_MUN" %in% names(df)) df$nome_mun <- df$NOME_MUN
+
+      df$uf <- .to_uf(df$uf)
+      df$cod_mun7 <- .to_mun7(df$cod_mun7)
+      df$nome_mun <- as.character(df$nome_mun)
+      df$lat <- .as_num(df$lat)
+      df$lon <- .as_num(df$lon)
+
+      df <- df[
+        !is.na(df$uf) & nzchar(df$uf) &
+          !is.na(df$cod_mun7) & nzchar(df$cod_mun7) &
+          is.finite(df$lat) & is.finite(df$lon),
+        ,
+        drop = FALSE
+      ]
+      if (nrow(df) == 0) return(data.frame())
+
+      df$key <- paste0(df$uf, "|", df$cod_mun7)
+      df <- df[!duplicated(df$key), , drop = FALSE]
+      df
+    }
+
+    centroids <- .load_centroids()
+    assign("centroids", centroids, envir = cache_env)
+    assign("centroids_by_uf", if (nrow(centroids) > 0) split(centroids, centroids$uf) else list(), envir = cache_env)
+
+    get_mun_index <- function(uf = NULL, query = NULL, limit = 6000L, ...) {
+      cent <- get("centroids", envir = cache_env, inherits = FALSE)
+      if (!is.data.frame(cent) || nrow(cent) == 0) return(data.frame())
+
+      ufx <- .to_uf(uf)
+      df <- cent
+
+      if (!is.na(ufx) && nzchar(ufx)) df <- df[df$uf == ufx, , drop = FALSE]
+      if (!is.null(query) && length(query) > 0) {
+        q <- .norm_str(query)
+        if (length(q) && nzchar(q[[1]])) {
+          qq <- q[[1]]
+          nm <- .norm_str(df$nome_mun)
+          keep <- !is.na(nm) & grepl(qq, nm, fixed = TRUE)
+          df <- df[keep, , drop = FALSE]
+        }
+      }
+
+      lim <- suppressWarnings(as.integer(limit))
+      if (!is.finite(lim) || lim <= 0) lim <- 6000L
+      if (nrow(df) > lim) df <- df[seq_len(lim), , drop = FALSE]
+
+      df$label <- paste0(df$nome_mun, " - ", df$uf)
+      df[, c("uf", "cod_mun7", "nome_mun", "label", "lat", "lon"), drop = FALSE]
+    }
+
+    .roots_for_inc_level <- function(level) {
+      lvl <- .norm_level(level)
+      p <- .cfg_paths(cfg)
+
+      cands <- character(0)
+      if (lvl == "BR") {
+        cands <- c(cands, .res(p$PATH_BR), .res(cfg$PATH_BR), .res(p$PATH_INCIDENCE_BR), .res(cfg$PATH_INCIDENCE_BR))
+      }
+      if (lvl == "UF") {
+        cands <- c(cands, .res(p$PATH_UF), .res(cfg$PATH_UF), .res(p$PATH_INCIDENCE_UF), .res(cfg$PATH_INCIDENCE_UF))
+      }
+      if (lvl == "MUN") {
+        cands <- c(
+          cands,
+          .res(p$PATH_MUN), .res(cfg$PATH_MUN),
+          .res(p$PATH_INCIDENCE_MUN), .res(cfg$PATH_INCIDENCE_MUN),
+          .res(p$PATH_MUNIN), .res(cfg$PATH_MUNIN),
+          .res(p$PATH_INCIDENCE_MUNIN), .res(cfg$PATH_INCIDENCE_MUNIN)
+        )
+      }
+
+      cands <- c(cands, p_inc)
+      cands <- as.character(cands)
+      cands <- cands[!is.na(cands) & nzchar(cands)]
+      cands <- unique(cands)
+      cands <- cands[dir.exists(cands)]
+      cands
+    }
+
+    .inc_part_dir <- function(level, ano, doenca_try) {
+      lvl <- .norm_level(level)
+      lvl_cands <- .inc_level_candidates(lvl)
+      y <- .as_int1(ano, NA_integer_)
+      if (!is.finite(y)) return(NULL)
+
+      doenca_try <- as.character(doenca_try)
+      doenca_try <- doenca_try[!is.na(doenca_try) & nzchar(doenca_try)]
+      roots <- .roots_for_inc_level(lvl)
+      if (length(roots) == 0) return(NULL)
+
+      key <- paste0(
+        "incdir|", lvl, "|", paste(lvl_cands, collapse = ","),
+        "|", y, "|", paste(doenca_try, collapse = ","),
+        "|", paste(roots, collapse = "||")
+      )
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        return(get(key, envir = cache_env, inherits = FALSE))
+      }
+
+      found_dir <- NULL
+      found_lvl <- NULL
+
+      .try_one <- function(root, lvlx, d1) {
+        c(
+          file.path(root, paste0("doenca=", d1), paste0("nivel=", lvlx), paste0("ano=", y)),
+          file.path(root, paste0("nivel=", lvlx), paste0("doenca=", d1), paste0("ano=", y)),
+          file.path(root, paste0("ano=", y), paste0("nivel=", lvlx), paste0("doenca=", d1)),
+          file.path(root, paste0("ano=", y), paste0("doenca=", d1), paste0("nivel=", lvlx))
+        )
+      }
+
+      if (length(doenca_try) > 0) {
+        for (root in roots) {
+          for (lvlx in lvl_cands) {
+            for (d1 in doenca_try) {
+              cands <- .try_one(root, lvlx, d1)
+              for (p in cands) {
+                if (dir.exists(p) && .has_parquet(p)) {
+                  found_dir <- .normpath(p)
+                  found_lvl <- lvlx
+                  break
+                }
+              }
+              if (!is.null(found_dir)) break
+            }
+            if (!is.null(found_dir)) break
+          }
+          if (!is.null(found_dir)) break
+        }
+      }
+
+      if (is.null(found_dir)) {
+        for (root in roots) {
+          pY <- file.path(root, paste0("ano=", y))
+          if (dir.exists(pY) && .has_parquet(pY)) {
+            found_dir <- .normpath(pY)
+            found_lvl <- NULL
+            break
+          }
+        }
+      }
+
+      if (is.null(found_dir)) {
+        for (root in roots) {
+          if (dir.exists(root) && .has_parquet(root)) {
+            found_dir <- .normpath(root)
+            found_lvl <- NULL
+            break
+          }
+        }
+      }
+
+      out <- if (is.null(found_dir)) NULL else list(dir = found_dir, nivel_used = found_lvl)
+      assign(key, out, envir = cache_env)
+      out
+    }
+
+    .years_available_fast <- function(level = "UF") {
+      lvl <- .norm_level(level)
+      key <- paste0("years|", lvl)
+      if (exists(key, envir = cache_env, inherits = FALSE)) return(get(key, envir = cache_env, inherits = FALSE))
+
+      yrs <- integer(0)
+
+      if (!is.null(p_ts) && dir.exists(p_ts) && .has_parquet(p_ts)) {
+        d1 <- doenca_vals[[1]] %||% ""
+        if (nzchar(d1)) yrs <- .years_from_dirs(p_ts, c(paste0("nivel=", lvl), paste0("doenca=", d1)))
+        if (length(yrs) == 0 && length(doenca_vals) > 1) {
+          d2 <- doenca_vals[[2]]
+          yrs <- .years_from_dirs(p_ts, c(paste0("nivel=", lvl), paste0("doenca=", d2)))
+        }
+        if (length(yrs) == 0) yrs <- .years_from_dirs(p_ts, paste0("nivel=", lvl))
+        if (length(yrs) == 0) yrs <- .years_from_dirs(p_ts)
+      }
+
+      if (length(yrs) == 0 && !is.null(p_inc) && dir.exists(p_inc) && .has_parquet(p_inc)) {
+        yrs <- .years_from_dirs(p_inc, c(paste0("nivel=", lvl)))
+        if (length(yrs) == 0) yrs <- .years_from_dirs(p_inc)
+      }
+
+      yrs <- suppressWarnings(as.integer(yrs))
+      yrs <- yrs[is.finite(yrs)]
+      yrs <- sort(unique(yrs))
+
+      assign(key, yrs, envir = cache_env)
+      yrs
+    }
+
+    get_years_available <- function(level = NULL, ...) .years_available_fast(level %||% "UF")
+
+    # -----------------------------
+    # Helper: pyramid directory (piramides/nivel=X/tipo=Y/...)
+    # Usado para dados demográficos de faixa etária
+    # -----------------------------
+    .pyr_part_dir <- function(level, tipo, ano, doenca_try) {
+      lvl <- .norm_level(level)
+      tipo <- toupper(as.character(tipo %||% "CASOS"))
+      if (!tipo %in% c("CASOS", "OBITOS", "CURA", "POP")) tipo <- "CASOS"
+      
+      y <- .as_int1(ano, NA_integer_)
+      if (!is.finite(y)) return(NULL)
+
+      doenca_try <- as.character(doenca_try)
+      doenca_try <- doenca_try[!is.na(doenca_try) & nzchar(doenca_try)]
+
+      dash <- .dashboard_dir(cfg)
+      p_pyr <- file.path(dash, "piramides")
+      if (!dir.exists(p_pyr)) return(NULL)
+
+      key <- paste0(
+        "pyrdir|", lvl, "|", tipo, "|", y, "|", paste(doenca_try, collapse = ","),
+        "|", p_pyr
+      )
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        return(get(key, envir = cache_env, inherits = FALSE))
+      }
+
+      found_dir <- NULL
+
+      .try_pyr_one <- function(root, lvlx, tipo_x, d1) {
+        c(
+          file.path(root, paste0("nivel=", lvlx), paste0("tipo=", tipo_x), paste0("doenca=", d1), paste0("ano=", y)),
+          file.path(root, paste0("nivel=", lvlx), paste0("tipo=", tipo_x), paste0("ano=", y), paste0("doenca=", d1)),
+          file.path(root, paste0("nivel=", lvlx), paste0("tipo=", tipo_x), paste0("doenca=", d1)),
+          file.path(root, paste0("nivel=", lvlx), paste0("tipo=", tipo_x))
+        )
+      }
+
+      if (length(doenca_try) > 0) {
+        for (d1 in doenca_try) {
+          cands <- .try_pyr_one(p_pyr, lvl, tipo, d1)
+          for (p in cands) {
+            if (dir.exists(p) && .has_parquet(p)) {
+              found_dir <- .normpath(p)
+              break
+            }
+          }
+          if (!is.null(found_dir)) break
+        }
+      }
+
+      out <- if (is.null(found_dir)) NULL else list(dir = found_dir)
+      assign(key, out, envir = cache_env)
+      out
+    }
+
+    # Helper: diretório de casos_0a14 (nivel=UF/MUN/BR, doenca=, ano=)
+    .cases0a14_part_dir <- function(level, ano, doenca_try) {
+      lvl <- .norm_level(level)
+      y <- .as_int1(ano, NA_integer_)
+      if (!is.finite(y)) return(NULL)
+
+      base <- p_cases_0a14 %||% .base_path_cases_0a14(cfg)
+      if (is.null(base) || !dir.exists(base)) return(NULL)
+
+      doenca_try <- as.character(doenca_try)
+      doenca_try <- doenca_try[!is.na(doenca_try) & nzchar(doenca_try)]
+
+      key <- paste0("cases0a14|", lvl, "|", y, "|", paste(doenca_try, collapse = ","), "|", .normpath(base))
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        return(get(key, envir = cache_env, inherits = FALSE))
+      }
+
+      found_dir <- NULL
+
+      .try_one <- function(root, lvlx, d1) {
+        c(
+          file.path(root, paste0("nivel=", lvlx), paste0("doenca=", d1), paste0("ano=", y)),
+          file.path(root, paste0("doenca=", d1), paste0("nivel=", lvlx), paste0("ano=", y)),
+          file.path(root, paste0("ano=", y), paste0("nivel=", lvlx), paste0("doenca=", d1)),
+          file.path(root, paste0("ano=", y), paste0("doenca=", d1), paste0("nivel=", lvlx))
+        )
+      }
+
+      if (length(doenca_try) > 0) {
+        for (d1 in doenca_try) {
+          cands <- .try_one(base, lvl, d1)
+          for (p in cands) {
+            if (dir.exists(p) && .has_parquet(p)) {
+              found_dir <- .normpath(p)
+              break
+            }
+          }
+          if (!is.null(found_dir)) break
+        }
+      }
+
+      if (is.null(found_dir)) {
+        pY <- file.path(base, paste0("ano=", y))
+        if (dir.exists(pY) && .has_parquet(pY)) found_dir <- .normpath(pY)
+      }
+
+      if (is.null(found_dir) && dir.exists(base) && .has_parquet(base)) {
+        found_dir <- .normpath(base)
+      }
+
+      out <- if (is.null(found_dir)) NULL else list(dir = found_dir)
+      assign(key, out, envir = cache_env)
+      out
+    }
+
+    # Helper: adiciona filtro de faixa etária
+    .add_filter_faixa <- function(filters, faixa) {
+      if (is.null(filters) || !is.list(filters)) filters <- list()
+      faixa <- as.character(faixa %||% c("0 a 14 anos", "0 a 14"))
+      filters <- .add_filters(filters, c("faixa", "faixa_etaria", "faixa_etária", "FAIXA", "FAIXA_ETARIA", "filtro", "FILTRO"), faixa)
+      filters
+    }
+
+    # API: centroids
+    # -----------------------------
+    get_mun_centroids <- function(uf = NULL, cod_mun7 = NULL, mun = NULL, geo_id = NULL, ...) {
+      df <- get("centroids", envir = cache_env, inherits = FALSE)
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      ufx <- .to_uf(uf)
+      munx <- .to_mun7(cod_mun7 %||% mun %||% geo_id)
+
+      if (!is.na(ufx) && nzchar(ufx)) {
+        byuf <- get("centroids_by_uf", envir = cache_env, inherits = FALSE)
+        if (is.list(byuf) && !is.null(byuf[[ufx]])) df <- byuf[[ufx]] else df <- df[df$uf == ufx, , drop = FALSE]
+      }
+      if (!is.na(munx) && nzchar(munx)) {
+        if (!is.na(ufx) && nzchar(ufx)) {
+          key <- paste0(ufx, "|", munx)
+          df <- df[df$key == key, , drop = FALSE]
+        } else {
+          df <- df[df$cod_mun7 == munx, , drop = FALSE]
+        }
+      }
+
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+      df
+    }
+
+    # -----------------------------
+    # API: time series
+    # -----------------------------
+    get_time_series <- function(ano = NULL, anos = NULL, years = NULL,
+                                level = NULL, nivel = NULL,
+                                uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                                metric = NULL, doenca = NULL, tb_grau_incapacidade = NULL,
+                                grau_incapacidade = NULL, ...) {
+
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      dd  <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+
+      yv  <- anos %||% years %||% ano
+      yv  <- suppressWarnings(as.integer(unlist(yv)))
+      yv  <- yv[is.finite(yv)]
+      if (length(yv) == 0) yv <- .years_available_fast(lvl)
+
+      if (is.null(p_ts) || !dir.exists(p_ts) || !.has_parquet(p_ts)) return(data.frame())
+
+      y_one <- if (length(yv) == 1) yv[[1]] else NULL
+
+      ts_root <- NULL
+      key_dir <- paste0("tsdir|", lvl, "|", paste(dd, collapse=","), "|", y_one %||% "multi", "|", .normpath(p_ts))
+
+      if (exists(key_dir, envir = cache_env, inherits = FALSE)) {
+        ts_root <- get(key_dir, envir = cache_env, inherits = FALSE)
+      } else {
+        if (length(dd) > 0) {
+          for (d1 in dd) {
+            if (!is.null(y_one)) {
+              ts_root <- .ts_try_dirs(p_ts, lvl, d1, yy = y_one)
+              if (!is.null(ts_root)) break
+            }
+            ts_root <- .ts_try_dirs(p_ts, lvl, d1, yy = NULL)
+            if (!is.null(ts_root)) break
+          }
+        }
+        if (is.null(ts_root)) ts_root <- p_ts
+        assign(key_dir, ts_root, envir = cache_env)
+      }
+
+      filters <- list()
+      filters <- .add_filter_level(filters, .inc_level_candidates(lvl))
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+
+      if (is.null(y_one)) {
+        filters <- .add_filter_ano(filters, yv)
+      }
+
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+      mun6 <- if (!is.na(munx) && nzchar(munx)) substr(munx, 1, 6) else NA_character_
+
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) {
+        mun_vals <- unique(stats::na.omit(c(munx, mun6)))
+        filters <- .add_filter_mun(filters, mun_vals)
+      }
+
+      keep_cols <- c(
+        "nivel","doenca","ano","mes","mes_nome","semana",
+        "uf","geo_id","geo_nome",
+        "casos","casos_total","casos_obitos","casos_cura",
+        "pop_total","incid_100k","incid_100k_total"
+      )
+
+      df <- .read_ds_fast(ts_root, ds_env, filters = filters, keep_cols = keep_cols, logger = logger, tag = "time_series")
+      df <- .std_ts_out(df)
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+      df
+    }
+
+    # -----------------------------
+    # API: KPIs agregados
+    # -----------------------------
+    get_scope <- function(ano = NULL, year = NULL,
+                          level = NULL, nivel = NULL,
+                          uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                          doenca = NULL, tb_grau_incapacidade = NULL, grau_incapacidade = NULL, ...) {
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      y <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(y)) return(data.frame())
+
+      dd   <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+
+      root_info <- .inc_part_dir(lvl, y, dd)
+      root <- root_info$dir %||% NULL
+      lvl_cands <- .inc_level_candidates(lvl)
+
+      .diag_last("scope", list(
+        level = lvl,
+        level_candidates = paste(lvl_cands, collapse = ","),
+        ano = y,
+        doenca = paste(dd, collapse = ","),
+        root = root %||% "NULL"
+      ))
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) return(data.frame())
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, y)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_level(filters, lvl_cands)
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) filters <- .add_filter_mun(filters, munx)
+
+      df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "scope")
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+      .summarise_scope(df)
+    }
+
+    # -----------------------------
+    # API: métricas por UF
+    # -----------------------------
+    get_uf_metrics <- function(ano = NULL, year = NULL, y = NULL, doenca = NULL,
+                               tb_grau_incapacidade = NULL, grau_incapacidade = NULL, ...) {
+      yy <- .as_int1(ano %||% year %||% y, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+      dd <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+
+      root_info <- .inc_part_dir("UF", yy, dd)
+      root <- root_info$dir %||% NULL
+      .diag_last("uf_metrics", list(ano = yy, doenca = paste(dd, collapse = ","), root = root %||% "NULL"))
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) return(data.frame())
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_level(filters, "UF")
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+
+      df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "uf_metrics")
+      df <- .std_metrics_out(df)
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      cols <- names(df)
+      uf_col <- .pick(cols, c("uf", "UF", "sg_uf", "SG_UF", "sigla_uf", "SIGLA_UF"))
+      if (is.null(uf_col)) return(data.frame())
+
+      c_cases <- .pick(cols, .metric_candidates("cases"))
+      c_incid <- .pick(cols, .metric_candidates("incid"))
+      c_pop   <- .pick(cols, .metric_candidates("pop"))
+      c_obt   <- .pick(cols, .metric_candidates("obitos"))
+      c_cura  <- .pick(cols, .metric_candidates("cura"))
+
+      df %>%
+        transmute(
+          uf = .to_uf(.data[[uf_col]]),
+          casos_total = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+          casos_obitos = if (!is.null(c_obt)) .as_num(.data[[c_obt]]) else NA_real_,
+          casos_cura = if (!is.null(c_cura)) .as_num(.data[[c_cura]]) else NA_real_,
+          pop_total = if (!is.null(c_pop)) .as_num(.data[[c_pop]]) else NA_real_,
+          incid_100k_total = if (!is.null(c_incid)) .as_num(.data[[c_incid]]) else NA_real_
+        ) %>%
+        filter(!is.na(.data$uf) & nzchar(.data$uf))
+    }
+
+    # -----------------------------
+    # API: métricas por município
+    # -----------------------------
+    get_mun_metrics <- function(ano = NULL, year = NULL,
+                               uf = NULL, sg_uf = NULL,
+                               mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                               doenca = NULL, tb_grau_incapacidade = NULL,
+                               grau_incapacidade = NULL, ...) {
+      yy <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+
+      ufx  <- .to_uf(uf %||% sg_uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+
+      if ((is.na(ufx) || !nzchar(ufx)) && (is.na(munx) || !nzchar(munx))) return(data.frame())
+
+      dd <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+
+      root_info <- .inc_part_dir("MUN", yy, dd)
+      root <- root_info$dir %||% NULL
+      lvl_cands <- .inc_level_candidates("MUN")
+
+      .diag_last("mun_metrics", list(
+        ano = yy, uf = ufx %||% "NULL", mun = munx %||% "NULL", doenca = paste(dd, collapse = ","),
+        level_candidates = paste(lvl_cands, collapse = ","),
+        root = root %||% "NULL"
+      ))
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) return(data.frame())
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_level(filters, lvl_cands)
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+
+      if (!is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (!is.na(munx) && nzchar(munx)) filters <- .add_filter_mun(filters, munx)
+
+      df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "mun_metrics")
+      df <- .std_metrics_out(df)
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      cols <- names(df)
+      label_col <- .pick(cols, c("nome_mun", "NOME_MUN", "nm_mun", "NM_MUN", "geo_nome", "geo_name", "municipio", "MUNICIPIO"))
+      key_col   <- .pick(cols, c("cod_mun7", "COD_MUN7", "geo_id", "GEO_ID", "CD_MUN", "cd_mun", "mun", "MUN"))
+      uf_col    <- .pick(cols, c("uf", "UF", "sg_uf", "SG_UF", "sigla_uf", "SIGLA_UF", "co_uf", "CO_UF"))
+
+      if (is.null(key_col)) key_col <- "cod_mun7"
+      if (is.null(label_col)) label_col <- key_col
+
+      c_cases <- .pick(cols, .metric_candidates("cases"))
+      c_incid <- .pick(cols, .metric_candidates("incid"))
+      c_pop   <- .pick(cols, .metric_candidates("pop"))
+      c_obt   <- .pick(cols, .metric_candidates("obitos"))
+      c_cura  <- .pick(cols, .metric_candidates("cura"))
+
+      out <- df %>%
+        transmute(
+          uf = if (!is.null(uf_col)) .to_uf(.data[[uf_col]]) else .to_uf(.data$uf),
+          cod_mun7 = .to_mun7(.data[[key_col]]),
+          nome_mun = as.character(.data[[label_col]]),
+          casos_total = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+          casos_obitos = if (!is.null(c_obt)) .as_num(.data[[c_obt]]) else NA_real_,
+          casos_cura = if (!is.null(c_cura)) .as_num(.data[[c_cura]]) else NA_real_,
+          pop_total = if (!is.null(c_pop)) .as_num(.data[[c_pop]]) else NA_real_,
+          incid_100k_total = if (!is.null(c_incid)) .as_num(.data[[c_incid]]) else NA_real_
+        ) %>%
+        filter(!is.na(.data$cod_mun7) & nzchar(.data$cod_mun7))
+
+      out <- .ensure_metrics_schema(out)
+
+      if (!is.na(munx) && nzchar(munx) && nrow(out) > 0) {
+        out <- out[out$cod_mun7 == munx, , drop = FALSE]
+        if (nrow(out) == 0) return(data.frame())
+      }
+
+      cent <- get("centroids", envir = cache_env, inherits = FALSE)
+      if (is.data.frame(cent) && nrow(cent) > 0 && nrow(out) > 0) {
+        idx <- match(out$cod_mun7, cent$cod_mun7)
+        out$lat <- cent$lat[idx]
+        out$lon <- cent$lon[idx]
+        out$uf <- ifelse(is.na(out$uf) | !nzchar(out$uf), cent$uf[idx], out$uf)
+        out$nome_mun <- ifelse(is.na(out$nome_mun) | !nzchar(out$nome_mun), cent$nome_mun[idx], out$nome_mun)
+        if (!is.na(ufx) && nzchar(ufx)) out <- out[out$uf == ufx, , drop = FALSE]
+      }
+
+      out
+    }
+
+    # -----------------------------
+    # API: UF metrics para faixa etária 0-14
+    # Carrega casos totais de 0 a 14 anos por estado
+    # Fonte preferencial: casos_0a14
+    # -----------------------------
+    get_uf_metrics_0_14 <- function(ano = NULL, year = NULL, doenca = NULL, uf = NULL, sg_uf = NULL, ...) {
+      yy <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+      dd <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      ufx <- .to_uf(uf %||% sg_uf)
+
+      # Fonte preferencial: casos_0a14
+      root_info <- .cases0a14_part_dir("UF", yy, dd)
+      root <- root_info$dir %||% NULL
+      is_piramides <- FALSE
+      .diag_last("uf_metrics_0_14", list(ano = yy, doenca = paste(dd, collapse = ","), root = root %||% "NULL"))
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) {
+        # fallback: piramides
+        root_info <- .pyr_part_dir("UF", "CASOS", yy, dd)
+        root <- root_info$dir %||% NULL
+        is_piramides <- TRUE
+      }
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) return(data.frame())
+
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_level(filters, "UF")
+      
+      # Piramides tem faixas separadas (0-4, 5-9, 10-14), casos_0a14 tem "0 a 14 anos"
+      if (is_piramides) {
+        # Buscar faixas separadas para somar
+        filters <- .add_filters(filters, c("faixa_etaria", "faixa"), c("0 a 4 anos", "5 a 9 anos", "10 a 14 anos"))
+      } else {
+        # casos_0a14 usa "0 a 14" no filtro
+        filters <- .add_filter_faixa(filters, c("0 a 14 anos", "0 a 14"))
+      }
+
+      df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "uf_metrics_0_14")
+
+      # Se não achou dados em casos_0a14, faz fallback para piramides
+      if ((!is.data.frame(df) || nrow(df) == 0) && !is_piramides) {
+        root_info <- .pyr_part_dir("UF", "CASOS", yy, dd)
+        root <- root_info$dir %||% NULL
+        if (!is.null(root) && dir.exists(root) && .has_parquet(root)) {
+          filters <- list()
+          filters <- .add_filter_ano(filters, yy)
+          filters <- .add_filter_doenca(filters, dd)
+          filters <- .add_filter_level(filters, "UF")
+          filters <- .add_filters(filters, c("faixa_etaria", "faixa"), c("0 a 4 anos", "5 a 9 anos", "10 a 14 anos"))
+          df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "uf_metrics_0_14")
+          is_piramides <- TRUE
+        }
+      }
+
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      cols <- names(df)
+      uf_col <- .col_pick_norm(cols, c("uf", "sg_uf", "sigla_uf", "codigo", "cod_uf", "co_uf", "uf_codigo", "uf_cod", "geo_id", "municipio", "município", "nome municipio", "nome_municipio", "nome município"))
+      if (is.null(uf_col)) return(data.frame())
+
+      c_cases <- .col_pick_norm(cols, c("valor", "casos_0_14", "casos_total", "casos", "total", "n"))
+      c_taxa  <- .col_pick_norm(cols, c("taxa_det", "taxa_det_0_14", "taxadet", "taxa"))
+      c_taxa  <- .col_pick_norm(cols, c("taxa_det", "taxa_det_0_14", "taxadet", "taxa"))
+
+      # Se é piramides, agregar por UF (somar as 3 faixas)
+      if (is_piramides) {
+        out <- df %>%
+          transmute(
+            uf = .to_uf(as.character(.data[[uf_col]])),
+            casos_0_14 = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+            taxa_det_0_14 = if (!is.null(c_taxa)) .as_num(.data[[c_taxa]]) else NA_real_
+          ) %>%
+          filter(!is.na(.data$uf) & nzchar(.data$uf)) %>%
+          group_by(.data$uf) %>%
+          summarise(
+            casos_0_14 = sum(.data$casos_0_14, na.rm = TRUE),
+            taxa_det_0_14 = mean(.data$taxa_det_0_14, na.rm = TRUE),
+            .groups = "drop"
+          )
+      } else {
+        out <- df %>%
+          transmute(
+            uf = .to_uf(as.character(.data[[uf_col]])),
+            casos_0_14 = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+            taxa_det_0_14 = if (!is.null(c_taxa)) .as_num(.data[[c_taxa]]) else NA_real_
+          ) %>%
+          filter(!is.na(.data$uf) & nzchar(.data$uf))
+      }
+      if (!is.na(ufx) && nzchar(ufx) && is.data.frame(out) && nrow(out) > 0) {
+        out <- out[out$uf == ufx, , drop = FALSE]
+      }
+      out
+    }
+
+    # -----------------------------
+    # API: Municipal metrics para faixa etária 0-14
+    # Carrega casos de 0 a 14 anos por município
+    # -----------------------------
+    get_mun_metrics_0_14 <- function(ano = NULL, year = NULL,
+                                    uf = NULL, sg_uf = NULL,
+                                    mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                                    doenca = NULL, ...) {
+      yy <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+
+      ufx  <- .to_uf(uf %||% sg_uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+
+      if ((is.na(ufx) || !nzchar(ufx)) && (is.na(munx) || !nzchar(munx))) return(data.frame())
+
+      dd <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+
+      # Fonte preferencial: casos_0a14
+      root_info <- .cases0a14_part_dir("MUN", yy, dd)
+      root <- root_info$dir %||% NULL
+      lvl_cands <- .inc_level_candidates("MUN")
+      is_piramides <- FALSE
+
+      .diag_last("mun_metrics_0_14", list(
+        ano = yy, uf = ufx %||% "NULL", mun = munx %||% "NULL", doenca = paste(dd, collapse = ","),
+        root = root %||% "NULL"
+      ))
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) {
+        # fallback: piramides
+        root_info <- .pyr_part_dir("MUN", "CASOS", yy, dd)
+        root <- root_info$dir %||% NULL
+        is_piramides <- TRUE
+      }
+
+      if (is.null(root) || !dir.exists(root) || !.has_parquet(root)) return(data.frame())
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_level(filters, lvl_cands)
+      
+      # Piramides tem faixas separadas (0-4, 5-9, 10-14), casos_0a14 tem "0 a 14 anos"
+      if (is_piramides) {
+        filters <- .add_filters(filters, c("faixa_etaria", "faixa"), c("0 a 4 anos", "5 a 9 anos", "10 a 14 anos"))
+      } else {
+        filters <- .add_filter_faixa(filters, c("0 a 14 anos", "0 a 14"))
+      }
+
+      if (!is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (!is.na(munx) && nzchar(munx)) filters <- .add_filter_mun(filters, munx)
+
+      df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "mun_metrics_0_14")
+
+      # Se não achou dados em casos_0a14, faz fallback para piramides
+      if ((!is.data.frame(df) || nrow(df) == 0) && !is_piramides) {
+        root_info <- .pyr_part_dir("MUN", "CASOS", yy, dd)
+        root <- root_info$dir %||% NULL
+        if (!is.null(root) && dir.exists(root) && .has_parquet(root)) {
+          filters <- list()
+          filters <- .add_filter_ano(filters, yy)
+          filters <- .add_filter_doenca(filters, dd)
+          filters <- .add_filter_level(filters, lvl_cands)
+          filters <- .add_filters(filters, c("faixa_etaria", "faixa"), c("0 a 4 anos", "5 a 9 anos", "10 a 14 anos"))
+          if (!is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+          if (!is.na(munx) && nzchar(munx)) filters <- .add_filter_mun(filters, munx)
+          df <- .read_ds_fast(root, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "mun_metrics_0_14")
+          is_piramides <- TRUE
+        }
+      }
+
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      cols <- names(df)
+      label_col <- .col_pick_norm(cols, c("nome_mun", "nome municipio", "municipio", "nome_municipio", "geo_nome", "geo_name", "nome"))
+      key_col   <- .col_pick_norm(cols, c("cod_mun7", "codigo", "cd_mun", "geo_id", "mun", "cod_mun"))
+      uf_col    <- .col_pick_norm(cols, c("uf", "sg_uf", "sigla_uf", "co_uf", "uf_codigo", "uf_cod", "codigo_uf"))
+
+      if (is.null(key_col)) key_col <- "cod_mun7"
+      if (is.null(label_col)) label_col <- key_col
+
+      c_cases <- .col_pick_norm(cols, c("valor", "casos_0_14", "casos_total", "casos", "total", "n"))
+      c_taxa  <- .col_pick_norm(cols, c("taxa_det", "taxa_det_0_14", "taxadet", "taxa"))
+
+      # Se é piramides, agregar por município (somar as 3 faixas)
+      if (is_piramides) {
+        out <- df %>%
+          transmute(
+            cod_mun7 = .to_mun7(.data[[key_col]]),
+            uf = if (!is.null(uf_col)) .to_uf(as.character(.data[[uf_col]])) else NA_character_,
+            nome_mun = if (!is.null(label_col)) as.character(.data[[label_col]]) else NA_character_,
+            casos_0_14 = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+            taxa_det_0_14 = if (!is.null(c_taxa)) .as_num(.data[[c_taxa]]) else NA_real_
+          ) %>%
+          filter(!is.na(.data$cod_mun7) & nzchar(.data$cod_mun7)) %>%
+          group_by(.data$cod_mun7, .data$uf, .data$nome_mun) %>%
+          summarise(
+            casos_0_14 = sum(.data$casos_0_14, na.rm = TRUE),
+            taxa_det_0_14 = mean(.data$taxa_det_0_14, na.rm = TRUE),
+            .groups = "drop"
+          )
+      } else {
+        out <- df %>%
+          transmute(
+            cod_mun7 = .to_mun7(.data[[key_col]]),
+            uf = if (!is.null(uf_col)) .to_uf(as.character(.data[[uf_col]])) else NA_character_,
+            nome_mun = if (!is.null(label_col)) as.character(.data[[label_col]]) else NA_character_,
+            casos_0_14 = if (!is.null(c_cases)) .as_num(.data[[c_cases]]) else NA_real_,
+            taxa_det_0_14 = if (!is.null(c_taxa)) .as_num(.data[[c_taxa]]) else NA_real_
+          ) %>%
+          filter(!is.na(.data$cod_mun7) & nzchar(.data$cod_mun7))
+      }
+
+      if (is.null(uf_col) && nrow(out) > 0) {
+        out$uf <- .to_uf(substr(out$cod_mun7, 1, 2))
+      }
+
+      out <- .ensure_metrics_schema(out)
+
+      if (!is.na(munx) && nzchar(munx) && nrow(out) > 0) {
+        out <- out[out$cod_mun7 == munx, , drop = FALSE]
+        if (nrow(out) == 0) return(data.frame())
+      }
+
+      cent <- get("centroids", envir = cache_env, inherits = FALSE)
+      if (is.data.frame(cent) && nrow(cent) > 0 && nrow(out) > 0) {
+        idx <- match(out$cod_mun7, cent$cod_mun7)
+        out$lat <- cent$lat[idx]
+        out$lon <- cent$lon[idx]
+        out$uf <- ifelse(is.na(out$uf) | !nzchar(out$uf), cent$uf[idx], out$uf)
+        out$nome_mun <- ifelse(is.na(out$nome_mun) | !nzchar(out$nome_mun), cent$nome_mun[idx], out$nome_mun)
+        if (!is.na(ufx) && nzchar(ufx)) out <- out[out$uf == ufx, , drop = FALSE]
+      }
+
+      out
+    }
+
+    get_mun_choropleth <- function(ano = NULL, year = NULL,
+                                   uf = NULL, sg_uf = NULL,
+                                   mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                                   doenca = NULL, ...) {
+      df <- get_mun_metrics(
+        ano = ano %||% year,
+        uf = uf %||% sg_uf,
+        mun = mun, cod_mun7 = cod_mun7, geo_id = geo_id,
+        doenca = doenca, ...
+      )
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+      keep <- c("uf", "cod_mun7", "nome_mun", "casos_total", "casos_obitos", "casos_cura", "pop_total", "incid_100k_total", "lat", "lon")
+      df[, intersect(names(df), keep), drop = FALSE]
+    }
+
+    # -----------------------------
+    # API: Ranking (UF ou Municípios Brasil)
+    # -----------------------------
+    get_ranking <- function(ano = NULL, year = NULL,
+                            level = NULL, nivel = NULL,
+                            kind = "cases",
+                            uf = NULL, doenca = NULL,
+                            top_n = 15, ...) {
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      yy  <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+
+      kind <- tolower(as.character(kind %||% "cases"))
+      if (!kind %in% c("cases","incid","pop","obitos","cura")) kind <- "cases"
+
+      dd <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      if (length(dd) == 0) return(data.frame())
+
+      ufx <- .to_uf(uf)
+      cache_key <- paste0("rank|", lvl, "|", kind, "|", yy, "|", paste(dd, collapse=","), "|", ufx %||% "", "|", as.integer(top_n))
+      if (exists(cache_key, envir = cache_env, inherits = FALSE)) {
+        return(get(cache_key, envir = cache_env, inherits = FALSE))
+      }
+
+      root_info <- .inc_part_dir(lvl, yy, dd)
+      root <- root_info$dir %||% NULL
+
+      if (!is.null(root) && dir.exists(root) && .has_parquet(root)) {
+        filters <- list()
+        filters <- .add_filter_ano(filters, yy)
+        filters <- .add_filter_doenca(filters, dd)
+        filters <- if (identical(lvl, "MUN")) .add_filter_level(filters, .inc_level_candidates("MUN")) else .add_filter_level(filters, lvl)
+        if (identical(lvl, "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+        filters <- .add_filter_sexo_total(filters)
+
+        ds <- .open_ds_cached(root, ds_env, logger = logger, tag = "rank_inc")
+        if (!is.null(ds)) {
+          cols <- .ds_cols(ds)
+          val_col <- .rank_value_col(cols, kind)
+
+          if (identical(lvl, "UF")) {
+            uf_col <- .pick(cols, c("uf","UF","sg_uf","SG_UF","sigla_uf","SIGLA_UF","co_uf","CO_UF"))
+            if (!is.null(val_col) && !is.null(uf_col)) {
+              df <- .query_rank_arrow(ds, filters, group_cols = c(uf_col), val_col, kind, top_n, logger, "rank_uf_inc")
+              if (is.data.frame(df) && nrow(df) > 0) {
+                out <- df %>%
+                  transmute(
+                    cat = as.character(.data[[uf_col]]),
+                    key = as.character(.data[[uf_col]]),
+                    val = suppressWarnings(as.numeric(.data$val))
+                  ) %>%
+                  filter(is.finite(.data$val) & !is.na(.data$cat) & nzchar(.data$cat))
+                assign(cache_key, out, envir = cache_env)
+                return(out)
+              }
+            }
+          } else {
+            key_col <- .pick(cols, c("cod_mun7","COD_MUN7","geo_id","GEO_ID","CD_MUN","cd_mun","mun","MUN"))
+            nm_col  <- .pick(cols, c("nome_mun","NOME_MUN","nm_mun","NM_MUN","geo_nome","GEO_NOME","municipio","MUNICIPIO","nome","NOME"))
+            uf_col2 <- .pick(cols, c("uf","UF","sg_uf","SG_UF","sigla_uf","SIGLA_UF","co_uf","CO_UF"))
+            if (!is.null(key_col)) {
+              if (is.null(nm_col)) nm_col <- key_col
+              group_cols <- unique(c(key_col, nm_col, uf_col2))
+
+              df <- data.frame()
+              if (!is.null(val_col)) {
+                df <- .query_rank_arrow(ds, filters, group_cols, val_col, kind, top_n, logger, "rank_mun_inc")
+              } else {
+                df <- .query_rank_long(ds, filters, group_cols, kind, top_n, logger, "rank_mun_inc_long")
+              }
+
+              if (is.data.frame(df) && nrow(df) > 0) {
+                key_digits <- .to_mun7(df[[key_col]])
+                cat_lbl    <- as.character(df[[nm_col]])
+                ufv        <- if (!is.null(uf_col2) && uf_col2 %in% names(df)) .to_uf(df[[uf_col2]]) else NA_character_
+                vv         <- suppressWarnings(as.numeric(df$val))
+
+                out <- data.frame(
+                  uf = ufv,
+                  cat = cat_lbl,
+                  key = key_digits,
+                  val = vv,
+                  stringsAsFactors = FALSE
+                )
+                out <- out[is.finite(out$val) & !is.na(out$key) & nzchar(out$key) & !is.na(out$cat) & nzchar(out$cat), , drop = FALSE]
+                assign(cache_key, out, envir = cache_env)
+                return(out)
+              }
+            }
+          }
+        }
+      }
+
+      if (!is.null(p_ts) && dir.exists(p_ts) && .has_parquet(p_ts) && identical(lvl, "MUN")) {
+        filters <- list()
+        filters <- .add_filter_ano(filters, yy)
+        filters <- .add_filter_doenca(filters, dd)
+        filters <- .add_filter_level(filters, .inc_level_candidates("MUN"))
+        if (!is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+        filters <- .add_filter_sexo_total(filters)
+
+        ds <- .open_ds_cached(p_ts, ds_env, logger = logger, tag = "rank_ts")
+        if (!is.null(ds)) {
+          cols <- .ds_cols(ds)
+
+          key_col <- .pick(cols, c("geo_id","GEO_ID","cod_mun7","COD_MUN7","CD_MUN","cd_mun","mun","MUN"))
+          nm_col  <- .pick(cols, c("geo_nome","GEO_NOME","nome_mun","NOME_MUN","municipio","MUNICIPIO","nome","NOME"))
+          uf_col2 <- .pick(cols, c("uf","UF","sg_uf","SG_UF","sigla_uf","SIGLA_UF","co_uf","CO_UF"))
+
+          if (!is.null(key_col)) {
+            if (is.null(nm_col)) nm_col <- key_col
+            group_cols <- unique(c(key_col, nm_col, uf_col2))
+
+            val_col <- .rank_value_col(cols, kind)
+            df <- data.frame()
+
+            if (!is.null(val_col)) {
+              df <- .query_rank_arrow(ds, filters, group_cols, val_col, kind, top_n, logger, "rank_mun_ts")
+            } else {
+              df <- .query_rank_long(ds, filters, group_cols, kind, top_n, logger, "rank_mun_ts_long")
+            }
+
+            if (is.data.frame(df) && nrow(df) > 0) {
+              key_digits <- .to_mun7(df[[key_col]])
+              cat_lbl    <- as.character(df[[nm_col]])
+              ufv        <- if (!is.null(uf_col2) && uf_col2 %in% names(df)) .to_uf(df[[uf_col2]]) else NA_character_
+              vv         <- suppressWarnings(as.numeric(df$val))
+
+              out <- data.frame(
+                uf = ufv,
+                cat = cat_lbl,
+                key = key_digits,
+                val = vv,
+                stringsAsFactors = FALSE
+              )
+              out <- out[is.finite(out$val) & !is.na(out$key) & nzchar(out$key) & !is.na(out$cat) & nzchar(out$cat), , drop = FALSE]
+              assign(cache_key, out, envir = cache_env)
+              return(out)
+            }
+          }
+        }
+      }
+
+      data.frame()
+    }
+
+    # -----------------------------
+    # API: Pirâmide (CASOS/POP/OBITOS/CURA)
+    # -----------------------------
+    get_piramide <- function(ano = NULL, year = NULL,
+                             level = NULL, nivel = NULL,
+                             uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                             tipo = NULL, doenca = NULL, ...) {
+      yy <- .as_int1(ano %||% year, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+
+      tp <- .norm_str(tipo %||% "CASOS")
+      tp <- if (length(tp) && nzchar(tp[[1]])) tp[[1]] else "CASOS"
+      if (!tp %in% c("CASOS", "POP", "OBITOS", "CURA")) tp <- "CASOS"
+
+      d_in <- .norm_str(doenca %||% doenca_vals[[1]] %||% "")
+      d_in <- if (length(d_in) && nzchar(d_in[[1]])) d_in[[1]] else (doenca_vals[[1]] %||% "")
+
+      if (is.null(p_pyr) || !dir.exists(p_pyr) || !.has_parquet(p_pyr)) return(data.frame())
+
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+      mun6 <- if (!is.na(munx) && nzchar(munx)) substr(munx, 1, 6) else NA_character_
+
+      d_cands <- unique(c(
+        d_in,
+        .norm_doenca(doenca %||% ""),
+        doenca_vals,
+        if (tp == "POP") c("POP") else character(0)
+      ))
+      d_cands <- d_cands[!is.na(d_cands) & nzchar(d_cands)]
+
+      # cache : guarda dir + doenca_used
+      key <- paste0("pyrdir|", lvl, "|", tp, "|", yy, "|", paste(d_cands, collapse = ","), "|", .normpath(p_pyr))
+      cache_val <- NULL
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        cache_val <- get(key, envir = cache_env, inherits = FALSE)
+      }
+
+      if (is.list(cache_val) && !is.null(cache_val$dir)) {
+        pdir <- cache_val$dir
+        d_used <- cache_val$doenca_used %||% d_in
+      } else {
+        pdir <- NULL
+        d_used <- d_in
+        for (d1 in d_cands) {
+          pdir <- .pyr_try_dirs(p_pyr, lvl, tp, d1, yy)
+          if (!is.null(pdir)) { d_used <- d1; break }
+        }
+        if (is.null(pdir)) pdir <- p_pyr
+        assign(key, list(dir = pdir, doenca_used = d_used), envir = cache_env)
+      }
+
+      .diag_last("piramide", list(level = lvl, tipo = tp, doenca = d_used, ano = yy, pdir = pdir %||% "NULL"))
+
+      if (is.null(pdir) || !dir.exists(pdir) || !.has_parquet(pdir)) return(data.frame())
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_level(filters, lvl)
+      filters <- .add_filter_tipo(filters, tp)
+      filters <- .add_filter_doenca(filters, d_used)
+
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) {
+        filters <- .add_filter_mun(filters, unique(c(munx, mun6)))
+      }
+
+      df <- .read_ds_fast(pdir, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "piramide")
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+      df
+    }
+
+    # -----------------------------
+    # API: Variáveis de interesse (sinan_landing) — retorna LONG “como está”
+    # -----------------------------
+    get_variaveis_interesse <- function(ano = NULL,
+                                        level = NULL, nivel = NULL,
+                                        uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                                        doenca = NULL, vars = NULL, sexo = NULL,
+                                        tb_grau_incapacidade = NULL, grau_incapacidade = NULL, ...) {
+      yy <- .as_int1(ano, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      dd  <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      d1  <- dd[[1]] %||% doenca_vals[[1]] %||% ""
+
+      if (is.null(p_cat) || !dir.exists(p_cat) || !.has_parquet(p_cat)) return(data.frame())
+
+      key <- paste0("landingdir|", lvl, "|", yy, "|", d1, "|", .normpath(p_cat))
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        pdir <- get(key, envir = cache_env, inherits = FALSE)
+      } else {
+        pdir <- .cat_try_dirs(p_cat, lvl, d1, yy)
+        if (is.null(pdir)) pdir <- p_cat
+        assign(key, pdir, envir = cache_env)
+      }
+
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+      mun6 <- if (!is.na(munx) && nzchar(munx)) substr(munx, 1, 6) else NA_character_
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- if (identical(lvl, "MUN")) .add_filter_level(filters, .inc_level_candidates("MUN")) else .add_filter_level(filters, lvl)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) {
+        mun_vals <- unique(stats::na.omit(c(munx, mun6)))
+        filters <- .add_filter_mun(filters, mun_vals)
+      }
+
+      df <- .read_ds_fast(pdir, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "variaveis_interesse")
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      nms <- names(df)
+      if (!"variavel" %in% nms && "VARIAVEL" %in% nms) df$variavel <- df$VARIAVEL
+      if (!"sexo" %in% nms && "SEXO" %in% nms) df$sexo <- df$SEXO
+      if (!"valor" %in% nms && "VALOR" %in% nms) df$valor <- df$VALOR
+      if (!"valor_lbl" %in% nms && "VALOR_LBL" %in% nms) df$valor_lbl <- df$VALOR_LBL
+      if (!"n" %in% nms && "N" %in% nms) df$n <- df$N
+
+      if (!"geo_nome" %in% nms && "GEO_NOME" %in% nms) df$geo_nome <- df$GEO_NOME
+      if (!"geo_id" %in% nms && "GEO_ID" %in% nms) df$geo_id <- df$GEO_ID
+
+      if ("uf" %in% names(df)) df$uf <- .to_uf(df$uf)
+      if ("geo_id" %in% names(df)) df$geo_id <- .to_mun7(df$geo_id)
+
+      if (!is.null(vars) && length(vars) > 0 && "variavel" %in% names(df)) {
+        vv <- toupper(trimws(as.character(vars)))
+        df <- df[toupper(trimws(as.character(df$variavel))) %in% vv, , drop = FALSE]
+      }
+      if (!is.null(sexo) && length(sexo) > 0 && "sexo" %in% names(df)) {
+        sx <- as.character(sexo)
+        df <- df[as.character(df$sexo) %in% sx, , drop = FALSE]
+      }
+
+      df
+    }
+
+    # -----------------------------
+    # API: Composição (categóricas)
+    # -----------------------------
+    get_composicao <- function(ano = NULL,
+                               level = NULL, nivel = NULL,
+                               uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                               doenca = NULL, vars = NULL, sexo = NULL, top_n = 30,
+                               tb_grau_incapacidade = NULL, grau_incapacidade = NULL, ...) {
+      yy <- .as_int1(ano, NA_integer_)
+      if (!is.finite(yy)) return(data.frame())
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      dd  <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      d1  <- dd[[1]] %||% doenca_vals[[1]] %||% ""
+
+      if (is.null(p_cat) || !dir.exists(p_cat) || !.has_parquet(p_cat)) return(data.frame())
+
+      key <- paste0("catdir|", lvl, "|", yy, "|", d1, "|", .normpath(p_cat))
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        pdir <- get(key, envir = cache_env, inherits = FALSE)
+      } else {
+        pdir <- .cat_try_dirs(p_cat, lvl, d1, yy)
+        if (is.null(pdir)) pdir <- p_cat
+        assign(key, pdir, envir = cache_env)
+      }
+
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+      mun6 <- if (!is.na(munx) && nzchar(munx)) substr(munx, 1, 6) else NA_character_
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- if (identical(lvl, "MUN")) .add_filter_level(filters, .inc_level_candidates("MUN")) else .add_filter_level(filters, lvl)
+      filters <- .add_filter_doenca(filters, dd)
+      filters <- .add_filter_tb_grau(filters, tb_grau_incapacidade %||% grau_incapacidade)
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) {
+        mun_vals <- unique(stats::na.omit(c(munx, mun6)))
+        filters <- .add_filter_mun(filters, mun_vals)
+      }
+
+      df <- .read_ds_fast(pdir, ds_env, filters = filters, keep_cols = NULL, logger = logger, tag = "composicao")
+      if (!is.data.frame(df) || nrow(df) == 0) return(data.frame())
+
+      nms <- names(df)
+      if (!"variavel" %in% nms) {
+        v0 <- .pick(nms, c("variavel", "VARIAVEL"))
+        if (!is.null(v0)) df$variavel <- df[[v0]]
+      }
+      if (!"sexo" %in% nms) {
+        s0 <- .pick(nms, c("sexo", "SEXO"))
+        if (!is.null(s0)) df$sexo <- df[[s0]]
+      }
+      if (!"valor_lbl" %in% nms) {
+        c0 <- .pick(nms, c("valor_lbl", "VALOR_LBL", "categoria", "CATEGORIA", "cat", "CAT"))
+        if (!is.null(c0)) df$valor_lbl <- df[[c0]]
+      }
+      if (!"n" %in% nms) {
+        n0 <- .pick(nms, c("n", "N", "total", "TOTAL"))
+        if (!is.null(n0)) df$n <- df[[n0]]
+      }
+
+      df$variavel <- as.character(df$variavel)
+      df$sexo <- as.character(df$sexo)
+      df$valor_lbl <- as.character(df$valor_lbl)
+      df$n <- .as_num(df$n)
+
+      df <- df[
+        is.finite(df$n) &
+          !is.na(df$variavel) & nzchar(df$variavel) &
+          !is.na(df$valor_lbl) & nzchar(df$valor_lbl),
+        ,
+        drop = FALSE
+      ]
+      if (nrow(df) == 0) return(data.frame())
+
+      if (!is.null(vars) && length(vars) > 0) {
+        vv <- toupper(trimws(as.character(vars)))
+        df <- df[toupper(trimws(df$variavel)) %in% vv, , drop = FALSE]
+      }
+      if (!is.null(sexo) && length(sexo) > 0) {
+        sx <- as.character(sexo)
+        df <- df[df$sexo %in% sx, , drop = FALSE]
+      }
+      grau_filter <- tb_grau_incapacidade %||% grau_incapacidade
+      grau_val <- .tb_grau_value(grau_filter)
+      grau_var <- .tb_grau_var(grau_filter)
+      if (!is.null(grau_val) && !is.null(grau_var)) {
+        same_var <- toupper(trimws(df$variavel)) == toupper(trimws(grau_var))
+        if (any(same_var, na.rm = TRUE)) {
+          keep <- !same_var | (same_var & df$valor_lbl %in% grau_val)
+          if ("valor" %in% names(df)) keep <- keep | (same_var & as.character(df$valor) %in% grau_val)
+          df <- df[keep, , drop = FALSE]
+        }
+      }
+      if (nrow(df) == 0) return(data.frame())
+
+      tn <- suppressWarnings(as.integer(top_n))
+      if (!is.finite(tn) || tn <= 0) tn <- 30L
+
+      out <- df %>%
+        group_by(variavel, sexo, valor_lbl) %>%
+        summarise(total = sum(n, na.rm = TRUE), .groups = "drop") %>%
+        arrange(desc(.data$total)) %>%
+        slice_head(n = max(200L, tn * 10L))
+
+      as.data.frame(out)
+    }
+
+    get_composicao_vars_available <- function(ano = NULL,
+                                             level = NULL, nivel = NULL,
+                                             uf = NULL, mun = NULL, cod_mun7 = NULL, geo_id = NULL,
+                                             doenca = NULL, ...) {
+      yy <- .as_int1(ano, NA_integer_)
+      if (!is.finite(yy)) return(character(0))
+      lvl <- .norm_level(level %||% nivel %||% "UF")
+      dd  <- .norm_doenca(doenca %||% doenca_vals[[1]] %||% "")
+      d1  <- dd[[1]] %||% doenca_vals[[1]] %||% ""
+
+      if (is.null(p_cat) || !dir.exists(p_cat) || !.has_parquet(p_cat)) return(character(0))
+
+      key <- paste0("catdir|", lvl, "|", yy, "|", d1, "|", .normpath(p_cat))
+      if (exists(key, envir = cache_env, inherits = FALSE)) {
+        pdir <- get(key, envir = cache_env, inherits = FALSE)
+      } else {
+        pdir <- .cat_try_dirs(p_cat, lvl, d1, yy)
+        if (is.null(pdir)) pdir <- p_cat
+        assign(key, pdir, envir = cache_env)
+      }
+
+      ufx  <- .to_uf(uf)
+      munx <- .to_mun7(mun %||% cod_mun7 %||% geo_id)
+
+      filters <- list()
+      filters <- .add_filter_ano(filters, yy)
+      filters <- .add_filter_level(filters, lvl)
+      filters <- .add_filter_doenca(filters, dd)
+      if (lvl %in% c("UF", "MUN") && !is.na(ufx) && nzchar(ufx)) filters <- .add_filter_uf(filters, ufx)
+      if (lvl == "MUN" && !is.na(munx) && nzchar(munx)) filters <- .add_filter_mun(filters, munx)
+
+      df <- .read_ds_fast(pdir, ds_env, filters = filters, keep_cols = c("variavel", "VARIAVEL"), logger = logger, tag = "composicao_vars")
+      if (!is.data.frame(df) || nrow(df) == 0) return(character(0))
+
+      nms <- names(df)
+      if (!"variavel" %in% nms && "VARIAVEL" %in% nms) df$variavel <- df$VARIAVEL
+      vv <- as.character(df$variavel)
+      vv <- vv[!is.na(vv) & nzchar(vv)]
+      sort(unique(vv))
+    }
+
+    # Cache de resultado dedicado, separado do cache_env de datasets/centroides
+    # para que o teto de entradas de um nao derrube o outro.
+    memo_env <- new.env(parent = emptyenv())
+    .M <- function(fn, tag) .memo_wrap(fn, tag, memo_env)
+
+    list(
+      cfg = cfg,
+      pack = pack,
+      DIAG = diag,
+      # get_diag/diag_snapshot NAO sao memoizados: leem estado que muda.
+      get_diag = .diag_sync,
+      diag_snapshot = .diag_sync,
+      get_years_available = .M(get_years_available, "years"),
+      get_time_series = .M(get_time_series, "ts"),
+      get_scope = .M(get_scope, "scope"),
+      get_uf_metrics = .M(get_uf_metrics, "uf"),
+      get_mun_metrics = .M(get_mun_metrics, "mun"),
+      get_uf_metrics_0_14 = .M(get_uf_metrics_0_14, "uf014"),
+      get_mun_metrics_0_14 = .M(get_mun_metrics_0_14, "mun014"),
+      get_mun_choropleth = .M(get_mun_choropleth, "choro"),
+      get_mun_centroids = .M(get_mun_centroids, "cent"),
+      get_mun_index = .M(get_mun_index, "idx"),
+      get_ranking = .M(get_ranking, "rank"),
+      get_piramide = .M(get_piramide, "pyr"),
+      get_variaveis_interesse = .M(get_variaveis_interesse, "vars"),
+      get_composicao = .M(get_composicao, "comp"),
+      get_composicao_vars_available = .M(get_composicao_vars_available, "compvars")
+    )
+  }
+
+  # -----------------------------
+  # PASSO 2: memoizar a propria API
+  # -----------------------------
+  # .build_api define ~18 closures a cada chamada, e o JIT do R recompila todas.
+  # No perfil de processo quente isso era 0,44 s de 0,80 s, com findCenvVar/cmp/
+  # cmpCall no topo do self time -- custo de compilador, nao de leitura de dado.
+  # Guardando o objeto pronto por assinatura de configuracao, so a 1a sessao paga.
+  #
+  # Ressalva: `logger` e `diag` passam a ser compartilhados entre sessoes do
+  # mesmo processo. Sao diagnostico, nao dado de tela.
+  .api_registry <- new.env(parent = emptyenv())
+
+  mod_data_api_info <- function() {
+    sigs <- ls(envir = .api_registry, all.names = TRUE)
+    data.frame(apis_em_cache = length(sigs), stringsAsFactors = FALSE)
+  }
+  assign("mod_data_api_info", mod_data_api_info, envir = globalenv())
+
+  function(cfg, pack = NULL) {
+    cfg  <- cfg %||% list()
+    pack <- pack %||% list()
+
+    sig <- tryCatch({
+      dv <- .norm_doenca((pack$DOENCA %||% cfg$DOENCA) %||% "")
+      .cache_signature(dv, list(.base_path_ts(cfg), .base_path_inc(cfg),
+                                .base_path_pyr(cfg), .base_path_cat(cfg),
+                                .base_path_cases_0a14(cfg)))
+    }, error = function(e) NULL)
+
+    if (is.null(sig)) return(.build_api(cfg, pack))
+    if (exists(sig, envir = .api_registry, inherits = FALSE)) {
+      return(get(sig, envir = .api_registry, inherits = FALSE))
+    }
+    api <- .build_api(cfg, pack)
+    assign(sig, api, envir = .api_registry)
+    api
+  }
+})
+
+
+mod_data <- function(cfg, pack = NULL) {
+  mod_data_init(cfg = cfg, pack = pack)
+}

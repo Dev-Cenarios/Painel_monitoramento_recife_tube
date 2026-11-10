@@ -1,0 +1,29 @@
+# -----------------------------------------------------------------------------
+# .Renviron para deploy no Shiny Server (Linux)
+#
+# COMO USAR NO SERVIDOR:
+#   1. copie este arquivo para  .Renviron  (mesmo diretorio, sem .example)
+#   2. ajuste os caminhos absolutos abaixo para a localizacao real no servidor
+#   3. reinicie o app:  sudo systemctl restart shiny-server   (ou touch restart.txt)
+#
+# O Shiny Server inicia o R com este diretorio como working dir, entao um
+# .Renviron aqui e lido automaticamente. Estas variaveis eliminam a
+# dependencia de "subir diretorios ate achar data/parquet", que e o que
+# costuma falhar quando so parte da arvore e copiada para /srv/shiny-server.
+# -----------------------------------------------------------------------------
+
+# Raiz do projeto (a pasta que contem  data/parquet )
+SINAN_ROOT=/srv/shiny-server/monitoramento-tuberculose
+
+# Pasta dos parquet (normalmente  <SINAN_ROOT>/data/parquet )
+SINAN_PARQ_ROOT=/srv/shiny-server/monitoramento-tuberculose/data/parquet
+
+# Pasta com o shapefile de bairros de Recife (recife_bairros.shp etc.)
+SINAN_SUPPORT_ROOT=/srv/shiny-server/monitoramento-tuberculose/data/fwmalharecife
+
+# Pasta com as imagens do cabecalho (Bandeira_Recife.jpeg, Cenarios_Logo.jpeg)
+SINAN_IMG_ROOT=/srv/shiny-server/monitoramento-tuberculose/data/Imagens
+
+# Locale UTF-8 (evita quebra no cruzamento de nomes de bairro)
+LANG=pt_BR.UTF-8
+LC_ALL=pt_BR.UTF-8

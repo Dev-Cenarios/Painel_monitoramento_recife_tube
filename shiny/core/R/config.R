@@ -1,0 +1,273 @@
+# core/R/config.R
+
+options(
+  shiny.sanitize.errors = FALSE,
+  shiny.fullstacktrace = TRUE
+)
+
+if (!exists("%||%", mode = "function")) {
+  `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
+}
+
+core_find_project_root <- function(from_dir) {
+  env_root <- Sys.getenv("SINAN_ROOT", unset = "")
+  if (nzchar(env_root)) {
+    env_root <- normalizePath(env_root, winslash = "/", mustWork = FALSE)
+    if (dir.exists(file.path(env_root, "data", "parquet"))) return(env_root)
+  }
+
+  p <- normalizePath(from_dir, winslash = "/", mustWork = FALSE)
+  for (i in 0:15) {
+    if (dir.exists(file.path(p, "data", "parquet"))) return(p)
+    up <- dirname(p)
+    if (identical(up, p)) break
+    p <- up
+  }
+  stop("Não consegui localizar ROOT do projeto (pasta com data/parquet) a partir de: ", from_dir, call. = FALSE)
+}
+
+core_get_config <- function(app_dir, doenca, year_min = 2010L, year_max = 2025L) {
+  APP_DIR  <- normalizePath(app_dir, winslash = "/", mustWork = FALSE)
+  CORE_DIR <- normalizePath(file.path(APP_DIR, "..", ".."), winslash = "/", mustWork = FALSE)
+
+  env_parq <- Sys.getenv("SINAN_PARQ_ROOT", unset = "")
+  if (nzchar(env_parq)) {
+    PARQ_ROOT <- normalizePath(env_parq, winslash = "/", mustWork = FALSE)
+    ROOT <- normalizePath(dirname(dirname(PARQ_ROOT)), winslash = "/", mustWork = FALSE)
+  } else {
+    ROOT <- core_find_project_root(CORE_DIR)
+    PARQ_ROOT <- file.path(ROOT, "data", "parquet")
+  }
+
+  DOENCA <- toupper(as.character(doenca %||% "TUBERCULOSE"))
+  YEAR_MIN <- as.integer(year_min)
+  YEAR_MAX <- as.integer(year_max)
+
+  DASHBOARD_DIR <- PARQ_ROOT
+
+  # Contagem exata: cara (varre a arvore toda). Memoizada porque o config
+  # original chamava a mesma contagem varias vezes sobre os mesmos diretorios.
+  .count_cache <- new.env(parent = emptyenv())
+
+  .parquet_count <- function(p) {
+    if (!is.character(p) || !nzchar(p) || !dir.exists(p)) return(0L)
+    key <- paste0("n::", p)
+    if (exists(key, envir = .count_cache, inherits = FALSE)) {
+      return(get(key, envir = .count_cache, inherits = FALSE))
+    }
+    n <- length(list.files(p, pattern = "\\.parquet$", recursive = TRUE, full.names = TRUE))
+    assign(key, n, envir = .count_cache)
+    n
+  }
+
+  # "Existe ao menos um parquet?" nao precisa da contagem: precisa do primeiro.
+  # Busca em largura com saida antecipada -- numa VM com disco virtualizado
+  # cada stat custa ordens de grandeza mais que em SSD local, e a versao antiga
+  # pagava a arvore inteira para responder TRUE.
+  .has_parquet <- function(p, max_depth = 6L) {
+    if (!is.character(p) || !nzchar(p) || !dir.exists(p)) return(FALSE)
+    key <- paste0("has::", p)
+    if (exists(key, envir = .count_cache, inherits = FALSE)) {
+      return(get(key, envir = .count_cache, inherits = FALSE))
+    }
+
+    fila <- p
+    prof <- 0L
+    achou <- FALSE
+    while (length(fila) > 0 && prof <= max_depth) {
+      for (d in fila) {
+        if (length(list.files(d, pattern = "\\.parquet$", recursive = FALSE)) > 0) {
+          achou <- TRUE
+          break
+        }
+      }
+      if (achou) break
+      fila <- unlist(lapply(fila, function(d) {
+        tryCatch(list.dirs(d, recursive = FALSE, full.names = TRUE), error = function(e) character(0))
+      }), use.names = FALSE)
+      prof <- prof + 1L
+    }
+
+    assign(key, achou, envir = .count_cache)
+    achou
+  }
+
+  .pick_dir_case_insensitive <- function(name) {
+    p <- file.path(DASHBOARD_DIR, name)
+    if (dir.exists(p)) return(p)
+    ds <- list.dirs(DASHBOARD_DIR, recursive = FALSE, full.names = TRUE)
+    if (length(ds) == 0) return(p)
+    hit <- ds[tolower(basename(ds)) == tolower(name)]
+    if (length(hit) > 0) return(hit[[1]])
+    p
+  }
+
+  .best_existing_by_parquet <- function(cands) {
+    cands <- as.character(cands)
+    cands <- cands[!is.na(cands) & nzchar(cands) & dir.exists(cands)]
+    if (length(cands) == 0) return(NULL)
+    cnt <- vapply(cands, .parquet_count, integer(1))
+    if (all(cnt <= 0L)) return(cands[[1]])
+    cands[[which.max(cnt)]]
+  }
+
+  PATH_INCIDENCE <- .pick_dir_case_insensitive("incidence")
+
+  .find_inc_level_dir <- function(lev) {
+    lev <- toupper(as.character(lev))
+
+    if (!dir.exists(PATH_INCIDENCE)) return(NULL)
+
+    d_doenca_1 <- paste0("doenca=", DOENCA)
+    d_doenca_2 <- paste0("doenca=", tolower(DOENCA))
+    d_nivel_1  <- paste0("nivel=", lev)
+    d_nivel_2  <- paste0("nivel=", tolower(lev))
+
+    cands_direct <- c(
+      file.path(PATH_INCIDENCE, d_doenca_1, d_nivel_1),
+      file.path(PATH_INCIDENCE, d_doenca_2, d_nivel_1),
+      file.path(PATH_INCIDENCE, d_doenca_1, d_nivel_2),
+      file.path(PATH_INCIDENCE, d_doenca_2, d_nivel_2),
+      file.path(PATH_INCIDENCE, d_nivel_1, d_doenca_1),
+      file.path(PATH_INCIDENCE, d_nivel_1, d_doenca_2),
+      file.path(PATH_INCIDENCE, d_nivel_2, d_doenca_1),
+      file.path(PATH_INCIDENCE, d_nivel_2, d_doenca_2)
+    )
+    # Caminho canonico primeiro. Este e o layout que a extracao produz
+    # (incidence/doenca=<D>/nivel=<LEV>) e responde sem contar nada; so caimos
+    # na busca por melhor candidato quando ele nao existe.
+    canonico <- file.path(PATH_INCIDENCE, d_doenca_1, d_nivel_1)
+    if (dir.exists(canonico) && .has_parquet(canonico)) return(canonico)
+
+    hit_direct <- .best_existing_by_parquet(cands_direct)
+    if (!is.null(hit_direct) && .has_parquet(hit_direct)) return(hit_direct)
+
+    all_dirs <- list.dirs(PATH_INCIDENCE, recursive = TRUE, full.names = TRUE)
+    if (length(all_dirs) == 0) return(NULL)
+
+    ok_doenca <- grepl("doenca=", all_dirs, ignore.case = TRUE) & grepl(paste0("doenca=", DOENCA), all_dirs, ignore.case = TRUE)
+    ok_nivel  <- grepl(paste0("nivel=", lev), all_dirs, ignore.case = TRUE)
+    cands <- all_dirs[ok_doenca & ok_nivel]
+
+    if (length(cands) == 0) {
+      ok_doenca2 <- grepl(paste0("doenca=", DOENCA), all_dirs, ignore.case = TRUE)
+      ok_nivel2  <- grepl("nivel=", all_dirs, ignore.case = TRUE) & grepl(lev, all_dirs, ignore.case = TRUE)
+      cands <- all_dirs[ok_doenca2 & ok_nivel2]
+    }
+
+    if (length(cands) == 0) return(NULL)
+
+    depth <- vapply(strsplit(normalizePath(cands, winslash = "/", mustWork = FALSE), "/", fixed = TRUE), length, integer(1))
+    cnt   <- vapply(cands, .parquet_count, integer(1))
+    ord <- order(depth, -cnt)
+    cands <- cands[ord]
+    best <- cands[[1]]
+    if (.has_parquet(best)) best else .best_existing_by_parquet(cands)
+  }
+
+  INCIDENCE_MODE <- if (dir.exists(PATH_INCIDENCE) && .has_parquet(PATH_INCIDENCE)) "unified" else "split"
+
+  PATH_BR  <- NULL
+  PATH_UF  <- NULL
+  PATH_MUN <- NULL
+
+  if (identical(INCIDENCE_MODE, "unified")) {
+    PATH_BR  <- .find_inc_level_dir("BR")  %||% PATH_INCIDENCE
+    PATH_UF  <- .find_inc_level_dir("UF")  %||% PATH_INCIDENCE
+    PATH_MUN <- .find_inc_level_dir("MUN") %||% PATH_INCIDENCE
+  } else {
+    pbr  <- .pick_dir_case_insensitive("incidence_br")
+    puf  <- .pick_dir_case_insensitive("incidence_uf")
+    pmun <- .pick_dir_case_insensitive("incidence_mun")
+
+    PATH_BR  <- if (dir.exists(pbr)  && .has_parquet(pbr))  pbr  else .find_inc_level_dir("BR")
+    PATH_UF  <- if (dir.exists(puf)  && .has_parquet(puf))  puf  else .find_inc_level_dir("UF")
+    PATH_MUN <- if (dir.exists(pmun) && .has_parquet(pmun)) pmun else .find_inc_level_dir("MUN")
+  }
+
+  incidence_path <- function(nivel = c("BR", "UF", "MUN")) {
+    nivel <- toupper(match.arg(nivel))
+    if (nivel == "BR")  return(PATH_BR)
+    if (nivel == "UF")  return(PATH_UF)
+    PATH_MUN
+  }
+
+  incidence_year_path <- function(nivel = c("BR", "UF", "MUN"), ano) {
+    nivel <- toupper(match.arg(nivel))
+    ano <- suppressWarnings(as.integer(ano))
+    if (!is.finite(ano)) return(NULL)
+    p <- incidence_path(nivel)
+    if (is.null(p) || !dir.exists(p)) return(NULL)
+    file.path(p, paste0("ano=", ano))
+  }
+
+  PATH_LANDING <- .pick_dir_case_insensitive("sinan_landing")
+  PATH_TIME_SERIES <- .pick_dir_case_insensitive("_cache_ts")
+  PATH_PIRAMIDES <- .pick_dir_case_insensitive("piramides")
+
+  .diag_counts <- identical(Sys.getenv("SINAN_DEBUG", unset = ""), "1") ||
+    isTRUE(tryCatch(get("SINAN_DEBUG", inherits = TRUE), error = function(e) FALSE))
+
+  PATHS <- NULL
+  if (exists("sinan_paths_cached", mode = "function", inherits = TRUE)) {
+    PATHS <- tryCatch(
+      sinan_paths_cached(app_dir = APP_DIR, root = ROOT, strict = FALSE),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(PATHS) || !is.list(PATHS)) {
+    PATHS <- list(
+      ROOT = ROOT,
+      DASHBOARD_DIR = DASHBOARD_DIR,
+      PATH_TS = PATH_TIME_SERIES,
+      PATH_INCIDENCE = PATH_INCIDENCE,
+      PATH_PIRAMIDES = PATH_PIRAMIDES,
+      PATH_SINAN_LANDING = PATH_LANDING
+    )
+  }
+
+  list(
+    DOENCA = DOENCA,
+    LOCK_RECIFE = TRUE,
+    RECIFE_MUN7 = "2611606",
+    RECIFE_UF = "PE",
+    YEAR_MIN = YEAR_MIN,
+    YEAR_MAX = YEAR_MAX,
+
+    APP_DIR = APP_DIR,
+    CORE_DIR = CORE_DIR,
+    ROOT = ROOT,
+    PARQ_ROOT = PARQ_ROOT,
+    DASHBOARD_DIR = DASHBOARD_DIR,
+
+    PATHS = PATHS,
+
+    PATH_INCIDENCE_MODE = INCIDENCE_MODE,
+    PATH_INCIDENCE = PATH_INCIDENCE,
+    PATH_BR  = PATH_BR,
+    PATH_UF  = PATH_UF,
+    PATH_MUN = PATH_MUN,
+
+    incidence_path = incidence_path,
+    incidence_year_path = incidence_year_path,
+
+    PATH_LANDING = PATH_LANDING,
+    PATH_TIME_SERIES = PATH_TIME_SERIES,
+    PATH_PIRAMIDES = PATH_PIRAMIDES,
+
+    PATH_DUMP_STAGE = file.path(PARQ_ROOT, "_dump_stage_sinan"),
+
+    # Diagnostico apenas: nenhum destes e lido fora deste arquivo (verificado
+    # por grep em core/ e diagnose_server.R). Cada um varre a arvore inteira,
+    # somando ~900 arquivos no startup, entao so sao computados sob
+    # SINAN_DEBUG=1. Fora disso ficam NA, que e o que "nao medido" significa.
+    N_PARQUET_INCIDENCE = if (.diag_counts) .parquet_count(PATH_INCIDENCE) else NA_integer_,
+    N_PARQUET_BR  = if (.diag_counts) .parquet_count(PATH_BR) else NA_integer_,
+    N_PARQUET_UF  = if (.diag_counts) .parquet_count(PATH_UF) else NA_integer_,
+    N_PARQUET_MUN = if (.diag_counts) .parquet_count(PATH_MUN) else NA_integer_,
+    N_PARQUET_LANDING = if (.diag_counts) .parquet_count(PATH_LANDING) else NA_integer_,
+    N_PARQUET_TS = if (.diag_counts) .parquet_count(PATH_TIME_SERIES) else NA_integer_,
+    N_PARQUET_PIR = if (.diag_counts) .parquet_count(PATH_PIRAMIDES) else NA_integer_
+  )
+}
